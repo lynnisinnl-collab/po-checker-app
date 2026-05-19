@@ -27,8 +27,9 @@ OUTPUT_FILENAME = "PO_Checking_Report.xlsx"
 # ==========================================
 # UI FILE UPLOADERS
 # ==========================================
-excel_file = st.file_uploader("👉 Step 1: Upload System Master Data (Excel or CSV)", type=["xlsx", "xls", "csv"])
-pdf_files = st.file_uploader("👉 Step 2: Upload PO PDF file(s)", type=["pdf"], accept_multiple_files=True)
+# Fixed: Added explicit unique keys to widgets to manage state cleanly
+excel_file = st.file_uploader("👉 Step 1: Upload System Master Data (Excel or CSV)", type=["xlsx", "xls", "csv"], key="master_data_excel_csv")
+pdf_files = st.file_uploader("👉 Step 2: Upload PO PDF file(s)", type=["pdf"], accept_multiple_files=True, key="po_pdf_files_list")
 
 # Helper function to remove spaces/hyphens
 def clean_key(val):
@@ -114,7 +115,15 @@ if excel_file and pdf_files:
         for idx, pdf_file in enumerate(pdf_files):
             st.write(f"🔍 AI is processing: **{pdf_file.name}**")
             try:
+                # CRITICAL FIX: Reset stream buffer pointer before reading
+                pdf_file.seek(0)
                 pdf_bytes = pdf_file.read()
+                
+                # Check to prevent empty payloads
+                if len(pdf_bytes) == 0:
+                    st.error(f"⚠️ File data for {pdf_file.name} was read empty. Skipping...")
+                    continue
+
                 response = model.generate_content([
                     {'mime_type': 'application/pdf', 'data': pdf_bytes},
                     prompt
@@ -137,6 +146,10 @@ if excel_file and pdf_files:
                 st.error(f"❌ Failed to parse {pdf_file.name}: {e}")
             
             progress_bar.progress((idx + 1) / len(pdf_files))
+
+        if not all_po_items:
+            st.error("❌ No data was successfully extracted from your PDF(s). Processing stopped.")
+            st.stop()
 
         df_po = pd.DataFrame(all_po_items)
         st.write("🔄 Generating block-comparison report...")
