@@ -1,6 +1,7 @@
 import os
 import json
 import io
+import time  # Fix: Imported time to support the 12-second pause delay
 import pandas as pd
 import google.generativeai as genai
 import openpyxl
@@ -27,7 +28,6 @@ OUTPUT_FILENAME = "PO_Checking_Report.xlsx"
 # ==========================================
 # UI FILE UPLOADERS
 # ==========================================
-# Fixed: Added explicit unique keys to widgets to manage state cleanly
 excel_file = st.file_uploader("👉 Step 1: Upload System Master Data (Excel or CSV)", type=["xlsx", "xls", "csv"], key="master_data_excel_csv")
 pdf_files = st.file_uploader("👉 Step 2: Upload PO PDF file(s)", type=["pdf"], accept_multiple_files=True, key="po_pdf_files_list")
 
@@ -89,8 +89,10 @@ if excel_file and pdf_files:
             if unnamed_col not in df_excel.columns:
                 df_excel.insert(cols_list.index('Notes') + 1, unnamed_col, None)
 
-        # AI PDF Parsing
-        model = genai.GenerativeModel('gemini-2.5-flash')
+        # ==========================================
+        # PLACED HERE: AI PDF Parsing Block (With stream fix & rate limiter)
+        # ==========================================
+        model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = """
         You are a purchase order parsing expert. Read the PDF purchase order and extract all "Line Items".
         Output ONLY a valid standard JSON Array. Do NOT include markdown syntax (like ```json) or any extra text.
@@ -115,11 +117,10 @@ if excel_file and pdf_files:
         for idx, pdf_file in enumerate(pdf_files):
             st.write(f"🔍 AI is processing: **{pdf_file.name}**")
             try:
-                # CRITICAL FIX: Reset stream buffer pointer before reading
+                # Reset stream buffer pointer before reading
                 pdf_file.seek(0)
                 pdf_bytes = pdf_file.read()
                 
-                # Check to prevent empty payloads
                 if len(pdf_bytes) == 0:
                     st.error(f"⚠️ File data for {pdf_file.name} was read empty. Skipping...")
                     continue
@@ -142,11 +143,25 @@ if excel_file and pdf_files:
                 for item in items_data:
                     item['PO_Source_File'] = pdf_file.name
                     all_po_items.append(item)
+                    
             except Exception as e:
-                st.error(f"❌ Failed to parse {pdf_file.name}: {e}")
+                # Check specifically if it's a rate limit error to give an intelligent warning
+                if "429" in str(e) or "quota" in str(e).lower():
+                    st.error(f"⚠️ Hit Google's speed limit on {pdf_file.name}. Pausing to reset...")
+                    time.sleep(10) # Force a longer sleep if we trip the error
+                else:
+                    st.error(f"❌ Failed to parse {pdf_file.name}: {e}")
             
             progress_bar.progress((idx + 1) / len(pdf_files))
+            
+            # CRITICAL RATE-LIMIT FIX: 
+            # If there are more PDFs left to parse, wait 12 seconds before the next one.
+            # (12 seconds * 5 files = 60 seconds, which perfectly respects the 5 RPM limit)
+            if idx < len(pdf_files) - 1:
+                with st.spinner("⏳ Waiting 12 seconds to respect Gemini Free Tier limits..."):
+                    time.sleep(12)
 
+        # Check if processing completely failed before continuing to Excel building
         if not all_po_items:
             st.error("❌ No data was successfully extracted from your PDF(s). Processing stopped.")
             st.stop()
