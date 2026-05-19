@@ -1,9 +1,9 @@
 import os
 import json
 import io
-import time  # Fix: Imported time to support the 12-second pause delay
+import time  
 import pandas as pd
-import google.generativeai as genai
+from google import genai  # Fix: Using the brand new official Google GenAI SDK
 import openpyxl
 from openpyxl.styles import PatternFill
 import streamlit as st
@@ -22,7 +22,8 @@ if not GOOGLE_API_KEY:
     st.error("🔑 Google API Key not found! Please configure it in your environment or secrets.")
     st.stop()
 
-genai.configure(api_key=GOOGLE_API_KEY)
+# Fix: Initialize the modern GenAI Client
+client = genai.Client(api_key=GOOGLE_API_KEY)
 OUTPUT_FILENAME = "PO_Checking_Report.xlsx"
 
 # ==========================================
@@ -90,9 +91,8 @@ if excel_file and pdf_files:
                 df_excel.insert(cols_list.index('Notes') + 1, unnamed_col, None)
 
         # ==========================================
-        # AI PDF Parsing Block (Model updated to gemini-1.5-flash-latest)
+        # Modern AI PDF Parsing Block
         # ==========================================
-        model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = """
         You are a purchase order parsing expert. Read the PDF purchase order and extract all "Line Items".
         Output ONLY a valid standard JSON Array. Do NOT include markdown syntax (like ```json) or any extra text.
@@ -125,10 +125,14 @@ if excel_file and pdf_files:
                     st.error(f"⚠️ File data for {pdf_file.name} was read empty. Skipping...")
                     continue
 
-                response = model.generate_content([
-                    {'mime_type': 'application/pdf', 'data': pdf_bytes},
-                    prompt
-                ])
+                # Fix: Modern payload formatting structure for the new client
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=[
+                        genai.types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'),
+                        prompt
+                    ]
+                )
                 raw_text = response.text.strip()
                 
                 start_idx = raw_text.find('[')
@@ -145,23 +149,19 @@ if excel_file and pdf_files:
                     all_po_items.append(item)
                     
             except Exception as e:
-                # Check specifically if it's a rate limit error to give an intelligent warning
                 if "429" in str(e) or "quota" in str(e).lower():
                     st.error(f"⚠️ Hit Google's speed limit on {pdf_file.name}. Pausing to reset...")
-                    time.sleep(10) # Force a longer sleep if we trip the error
+                    time.sleep(15) 
                 else:
                     st.error(f"❌ Failed to parse {pdf_file.name}: {e}")
             
             progress_bar.progress((idx + 1) / len(pdf_files))
             
-            # CRITICAL RATE-LIMIT FIX: 
-            # If there are more PDFs left to parse, wait 12 seconds before the next one.
-            # (12 seconds * 5 files = 60 seconds, which perfectly respects the 5 RPM limit)
+            # Rate-limiting cushion
             if idx < len(pdf_files) - 1:
                 with st.spinner("⏳ Waiting 12 seconds to respect Gemini Free Tier limits..."):
                     time.sleep(12)
 
-        # Check if processing completely failed before continuing to Excel building
         if not all_po_items:
             st.error("❌ No data was successfully extracted from your PDF(s). Processing stopped.")
             st.stop()
@@ -205,7 +205,6 @@ if excel_file and pdf_files:
         spacer_row = pd.DataFrame([{col: None for col in df_excel.columns}])
         df_final = pd.concat([df_excel, spacer_row, df_pdf], ignore_index=True)
         
-        # Save to local file environment
         df_final.to_excel(OUTPUT_FILENAME, index=False)
 
         # Highlight Mismatches using OpenPyXL
@@ -245,14 +244,12 @@ if excel_file and pdf_files:
                 if parse_date(cell_e.value) != parse_date(cell_p.value) and cell_p.value is not None:
                     cell_e.fill = fill_red; cell_p.fill = fill_red
 
-        # Save highlighted workbook to a byte stream buffer for Streamlit downloading
         excel_buffer = io.BytesIO()
         wb.save(excel_buffer)
         excel_buffer.seek(0)
 
         st.success("🎉 Process Complete!")
         
-        # Web Download button interface
         st.download_button(
             label="📥 Download Discrepancy Report",
             data=excel_buffer,
