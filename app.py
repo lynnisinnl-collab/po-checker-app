@@ -92,7 +92,7 @@ if excel_file and pdf_files:
         # ==========================================
         # PLACED HERE: AI PDF Parsing Block (With stream fix & rate limiter)
         # ==========================================
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
         prompt = """
         You are a purchase order parsing expert. Read the PDF purchase order and extract all "Line Items".
         Output ONLY a valid standard JSON Array. Do NOT include markdown syntax (like ```json) or any extra text.
