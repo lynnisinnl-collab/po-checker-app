@@ -90,7 +90,7 @@ if excel_file and pdf_files:
                 df_excel.insert(cols_list.index('Notes') + 1, unnamed_col, None)
 
         # ==========================================
-        # PLACED HERE: AI PDF Parsing Block (With stream fix & rate limiter)
+        # AI PDF Parsing Block (Model updated to gemini-1.5-flash-latest)
         # ==========================================
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
         prompt = """
