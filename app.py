@@ -26,12 +26,6 @@ if not GOOGLE_API_KEY:
 client = genai.Client(api_key=GOOGLE_API_KEY)
 OUTPUT_FILENAME = "PO_Checking_Report.xlsx"
 
-# ==========================================
-# UI FILE UPLOADERS
-# ==========================================
-excel_file = st.file_uploader("👉 Step 1: Upload System Master Data (Excel or CSV)", type=["xlsx", "xls", "csv"], key="master_data_excel_csv")
-pdf_files = st.file_uploader("👉 Step 2: Upload PO PDF file(s)", type=["pdf"], accept_multiple_files=True, key="po_pdf_files_list")
-
 # Helper function to remove spaces/hyphens/dots for matching keys
 def clean_key(val):
     if pd.isna(val) or val is None: return ""
@@ -64,6 +58,12 @@ def parse_date_to_custom_format(v):
         except: 
             continue
     return str(v).strip()
+
+# ==========================================
+# UI FILE UPLOADERS
+# ==========================================
+excel_file = st.file_uploader("👉 Step 1: Upload System Master Data (Excel or CSV)", type=["xlsx", "xls", "csv"], key="master_data_excel_csv")
+pdf_files = st.file_uploader("👉 Step 2: Upload PO PDF file(s)", type=["pdf"], accept_multiple_files=True, key="po_pdf_files_list")
 
 # ==========================================
 # APP PROCESSING LOGIC
@@ -217,7 +217,7 @@ if excel_file and pdf_files:
         df_final = df_final[cols]
         df_final.to_excel(OUTPUT_FILENAME, index=False)
 
-        # Highlight Mismatches sequentially via OpenPyXL cell indexing
+        # Style and Highlight via OpenPyXL cell indexing
         wb = openpyxl.load_workbook(OUTPUT_FILENAME)
         ws = wb.active
         headers = [cell.value for cell in ws[1]]
@@ -227,13 +227,20 @@ if excel_file and pdf_files:
         idx_price = headers.index('Unit Price') + 1 if 'Unit Price' in headers else None
         idx_date = headers.index('Required Date/Time') + 1 if 'Required Date/Time' in headers else None
 
+        # Style Fills
         fill_red = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+        fill_light_gray = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')
         
         # Loop over items step skipping by 3 to evaluate adjacent pairs 
         for i in range(len(df_excel)):
             row_excel_idx = (i * 3) + 2
             row_pdf_idx = (i * 3) + 3
             
+            # Apply light gray background background to the entire Excel base row
+            for col_idx in range(1, len(headers) + 1):
+                ws.cell(row=row_excel_idx, column=col_idx).fill = fill_light_gray
+
+            # Check Discrepancies (Mismatches will override the gray/white with red alert fill)
             if idx_line:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_line), ws.cell(row=row_pdf_idx, column=idx_line)
                 if clean_line_num(cell_e.value) != clean_line_num(cell_p.value) and cell_p.value is not None:
