@@ -134,18 +134,35 @@ if excel_file and pdf_files:
                 if len(pdf_bytes) == 0:
                     continue
 
-                response = client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=[
-                        types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=final_response_schema,
-                        temperature=0.0
-                    )
-                )
+                # --- PROTECTED API CALL WITH EMBEDDED RETRY LOGIC ---
+                max_retries = 4
+                retry_delay = 4  # Start with a 4 second delay
+                response = None
+                
+                for attempt in range(max_retries):
+                    try:
+                        response = client.models.generate_content(
+                            model='gemini-2.5-flash',
+                            contents=[
+                                types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'),
+                                prompt
+                            ],
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                response_schema=final_response_schema,
+                                temperature=0.0
+                            )
+                        )
+                        break  # Successfully generated content, break out of retry loop
+                    except Exception as api_err:
+                        err_msg = str(api_err)
+                        if "503" in err_msg or "UNAVAILABLE" in err_msg:
+                            if attempt < max_retries - 1:
+                                st.warning(f"⏳ Server overloaded (503). Retrying file {pdf_file.name} in {retry_delay}s... (Attempt {attempt + 1}/{max_retries})")
+                                time.sleep(retry_delay)
+                                retry_delay *= 2  # Double the wait time for the next attempt (exponential backoff)
+                                continue
+                        raise api_err  # If it's a critical non-503 error, pass it to the main block
                 
                 items_data = json.loads(response.text.strip())
                 for item in items_data:
@@ -157,7 +174,7 @@ if excel_file and pdf_files:
             
             progress_bar.progress((idx + 1) / len(pdf_files))
             if idx < len(pdf_files) - 1:
-                time.sleep(5)
+                time.sleep(4)
 
         if not all_po_items:
             st.error("❌ No data was extracted from your PDF items. Processing stopped.")
@@ -194,7 +211,6 @@ if excel_file and pdf_files:
             pdf_side_row['Data Block Source'] = 'PDF Extracted (PO Check Zone)'
             pdf_side_row[item_col_name] = excel_item
             
-            # Initialize the custom confirmation note logic string
             confirmation_note_text = ""
             
             if match is not None:
@@ -205,7 +221,6 @@ if excel_file and pdf_files:
                 pdf_side_row[unnamed_col] = match.get('Description', 'No Description')
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = f"Extracted from PDF: {match.get('PO_Source_File', '')}"
                 
-                # --- AUTOMATED MATCH CONFIRMATION COLUMN LOGIC ---
                 ex_line = clean_line_num(row.get('Line'))
                 pdf_line = clean_line_num(match.get('Line'))
                 
@@ -218,14 +233,12 @@ if excel_file and pdf_files:
                 ex_date = parse_date_to_custom_format(row.get('Required Date/Time'))
                 pdf_date = parse_date_to_custom_format(match.get('Required_Date'))
                 
-                # Validate if every field perfectly lines up across targets
                 if (ex_line == pdf_line and ex_qty == pdf_qty and ex_price == pdf_price and ex_date == pdf_date and ex_date != ""):
-                    today_str = datetime.now().strftime("%d%m") # Produces "2005"
+                    today_str = datetime.now().strftime("%d%m")
                     
-                    # Extract DDMM from the standardized date string (DD/MM/YYYY)
                     if '/' in ex_date:
                         date_parts = ex_date.split('/')
-                        delivery_ddmm = date_parts[0] + date_parts[1] # Produces "3009"
+                        delivery_ddmm = date_parts[0] + date_parts[1]
                     else:
                         delivery_ddmm = "".join([c for c in ex_date if c.isdigit()][:4])
                         
@@ -233,11 +246,9 @@ if excel_file and pdf_files:
             else:
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = "Not found in PO PDF"
             
-            # Assign confirmation note column data fields
             excel_side_row['Confirmation Note'] = confirmation_note_text
             pdf_side_row['Confirmation Note'] = confirmation_note_text
             
-            # Empty spacer dict row
             blank_spacer_row = {col: None for col in df_excel.columns}
             blank_spacer_row['Data Block Source'] = None
             blank_spacer_row['Confirmation Note'] = None
@@ -248,7 +259,6 @@ if excel_file and pdf_files:
 
         df_final = pd.DataFrame(structured_rows)
         
-        # Shift Data Block Source to the front, and position Confirmation Note exactly to the far right end
         core_cols = [c for c in df_final.columns if c not in ['Data Block Source', 'Confirmation Note']]
         cols = ['Data Block Source'] + core_cols + ['Confirmation Note']
         df_final = df_final[cols]
