@@ -4,7 +4,7 @@ import io
 import time  
 import pandas as pd
 from google import genai  
-from google.genai import types  # Import types for response_schema
+from google.genai import types  
 import openpyxl
 from openpyxl.styles import PatternFill
 import streamlit as st
@@ -32,7 +32,7 @@ OUTPUT_FILENAME = "PO_Checking_Report.xlsx"
 excel_file = st.file_uploader("👉 Step 1: Upload System Master Data (Excel or CSV)", type=["xlsx", "xls", "csv"], key="master_data_excel_csv")
 pdf_files = st.file_uploader("👉 Step 2: Upload PO PDF file(s)", type=["pdf"], accept_multiple_files=True, key="po_pdf_files_list")
 
-# Helper function to remove spaces/hyphens
+# Helper function to remove spaces/hyphens/dots for matching keys
 def clean_key(val):
     if pd.isna(val) or val is None: return ""
     return str(val).replace(" ", "").replace("-", "").replace(".", "").lower().strip()
@@ -53,12 +53,16 @@ def normalize_numeric(v):
     except:
         return None
 
-def parse_date(v):
-    if pd.isna(v) or v is None: return None
-    s = str(v).split(',')[0].strip().split()[0]
+# Custom date parser to output strictly DD/MM/YYYY
+def parse_date_to_custom_format(v):
+    if pd.isna(v) or v is None: return ""
+    s = str(v).replace(':', '').replace('Delivery Date', '').strip()
+    s = s.split(',')[0].strip().split()[0]
     for fmt in ('%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y', '%Y/%m/%d'):
-        try: return pd.to_datetime(s, format=fmt).strftime('%Y-%m-%d')
-        except: continue
+        try: 
+            return pd.to_datetime(s, format=fmt).strftime('%d/%m/%Y')
+        except: 
+            continue
     return str(v).strip()
 
 # ==========================================
@@ -75,40 +79,27 @@ if excel_file and pdf_files:
             
         df_excel.columns = df_excel.columns.astype(str).str.strip()
 
-        # Dynamically discover the primary Item Identification column in Master Data
-        # (Handles columns called 'Item', 'Material', 'Part Number', etc.)
+        # Discover the Primary Item Identification column in Master Data
         item_col_name = next((c for c in df_excel.columns if c.lower() in ['item', 'item number', 'material', 'part no', 'part number']), 'Item')
         if item_col_name not in df_excel.columns and len(df_excel.columns) > 0:
-            item_col_name = df_excel.columns[0] # Fallback to first column
+            item_col_name = df_excel.columns[0]
 
-        unnamed_col = None
-        cols_list = list(df_excel.columns)
-        if 'Notes' in cols_list:
-            notes_idx = cols_list.index('Notes')
-            if notes_idx + 1 < len(cols_list):
-                next_col = cols_list[notes_idx + 1]
-                if 'Unnamed' in next_col or next_col.strip() == '':
-                    unnamed_col = next_col
+        unnamed_col = next((c for c in df_excel.columns if 'Unnamed' in c), 'Description_Extracted')
+        if unnamed_col not in df_excel.columns:
+            df_excel[unnamed_col] = None
 
-        if not unnamed_col:
-            unnamed_col = next((c for c in df_excel.columns if 'Unnamed' in c), 'Unnamed: 5')
-            if unnamed_col not in df_excel.columns and 'Notes' in cols_list:
-                df_excel.insert(cols_list.index('Notes') + 1, unnamed_col, None)
-            elif unnamed_col not in df_excel.columns:
-                df_excel[unnamed_col] = None
-
-        # Define the exact layout schema we want Gemini to return
+        # Define structured extraction schema layout
         po_item_schema = types.Schema(
             type=types.Type.OBJECT,
             properties={
-                "Line": types.Schema(type=types.Type.STRING, description="The position or item number sequence, e.g., '0001', '1', '2'"),
-                "Item": types.Schema(type=types.Type.STRING, description="The core Drawing ID, Material Code, or Item identifier string (e.g. '00497-00552-B', '1117622.B')"),
-                "Description": types.Schema(type=types.Type.STRING, description="Textual description of the line item"),
-                "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity ordered"),
-                "Unit_Price": types.Schema(type=types.Type.STRING, description="Unit price amount"),
-                "Required_Date": types.Schema(type=types.Type.STRING, description="Target Delivery/Required Date found near the item block in YYYY-MM-DD format")
+                "Line": types.Schema(type=types.Type.STRING, description="The sequence position, e.g. '1', '2', '3'"),
+                "Item": types.Schema(type=types.Type.STRING, description="The drawing number or item string like '00497-00552-B' or '1117622.B'"),
+                "Description": types.Schema(type=types.Type.STRING, description="Product item text name description"),
+                "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity numerical value count"),
+                "Unit_Price": types.Schema(type=types.Type.STRING, description="Price per piece numeric value"),
+                "Required_Date": types.Schema(type=types.Type.STRING, description="Delivery Date string value")
             },
-            required=["Line", "Item", "Order_Quantity", "Unit_Price"]
+            required=["Item", "Order_Quantity", "Unit_Price"]
         )
 
         final_response_schema = types.Schema(
@@ -117,10 +108,14 @@ if excel_file and pdf_files:
         )
 
         prompt = """
-        You are an expert procurement analyst. Read the attached purchase order document.
-        Carefully parse out every individual line item. Note that tables might span across pages 
-        and line items or descriptions may be wrapped into multi-line blocks or stacked rows.
-        Isolate each part code/drawing index, matching it strictly with its respective quantity, unit price, and delivery date.
+        You are a meticulous purchase order parsing specialist. 
+        This PDF document stacks data values vertically across text blocks. 
+        Carefully associate each 'Item' (Drawing code/Part number) with its correct corresponding sequence order properties.
+        
+        CRITICAL RULES:
+        1. Look closely at blocks where multiple line numbers, quantities, or prices are listed together (e.g. 10, 1, 6). Unpack them step-by-step so that every distinct Item code gets its own unique object block.
+        2. Clean and capture the exact base 'Order Quantity' and 'Unit Price' values.
+        3. Extract the 'Delivery Date' associated with that item block.
         """
 
         all_po_items = []
@@ -133,10 +128,8 @@ if excel_file and pdf_files:
                 pdf_bytes = pdf_file.read()
                 
                 if len(pdf_bytes) == 0:
-                    st.error(f"⚠️ File data for {pdf_file.name} was read empty. Skipping...")
                     continue
 
-                # Use official configuration options to handle Structured JSON Outputs safely
                 response = client.models.generate_content(
                     model='gemini-2.5-flash',
                     contents=[
@@ -146,75 +139,85 @@ if excel_file and pdf_files:
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         response_schema=final_response_schema,
-                        temperature=0.1 # Low temp enforces high extraction accuracy
+                        temperature=0.0
                     )
                 )
                 
                 items_data = json.loads(response.text.strip())
-                    
                 for item in items_data:
                     item['PO_Source_File'] = pdf_file.name
                     all_po_items.append(item)
                     
             except Exception as e:
-                if "429" in str(e) or "quota" in str(e).lower():
-                    st.error(f"⚠️ Rate limit reached on {pdf_file.name}. Pausing...")
-                    time.sleep(15) 
-                else:
-                    st.error(f"❌ Failed to parse {pdf_file.name}: {e}")
+                st.error(f"❌ Failed to parse {pdf_file.name}: {e}")
             
             progress_bar.progress((idx + 1) / len(pdf_files))
-            
             if idx < len(pdf_files) - 1:
-                time.sleep(5) # Lowered wait step because official JSON mode reduces payload failure rates
+                time.sleep(5)
 
         if not all_po_items:
-            st.error("❌ No data was successfully extracted from your PDF(s). Processing stopped.")
+            st.error("❌ No data was extracted from your PDF items. Processing stopped.")
             st.stop()
 
         df_po = pd.DataFrame(all_po_items)
-        st.write("🔄 Generating cross-comparison tracking report...")
+        st.write("🔄 Alternating and structuring report layout rows...")
 
-        # Match Mapping Logic
-        pdf_rows = []
+        # Build precise custom alternated mapping matrix block:
+        # [Excel Row] -> [PDF Row] -> [Blank Spacer Row] -> Repeat
+        structured_rows = []
+        
         for idx, row in df_excel.iterrows():
             excel_item = str(row.get(item_col_name, '')).strip()
             excel_key = clean_key(excel_item)
             
+            # Formulate the Excel baseline dictionary row
+            excel_side_row = {col: row[col] for col in df_excel.columns}
+            excel_side_row['Data Block Source'] = 'Excel A (System Master Data)'
+            if 'Required Date/Time' in excel_side_row:
+                excel_side_row['Required Date/Time'] = parse_date_to_custom_format(excel_side_row['Required Date/Time'])
+            
+            # Search for the extracted PDF item match
             match = None
             if not df_po.empty and excel_key:
                 for _, po_row in df_po.iterrows():
                     po_item = str(po_row.get('Item', '')).strip()
                     po_key = clean_key(po_item)
-                    # Cross-string containing check to clean up mixed formats
                     if po_key and (po_key in excel_key or excel_key in po_key):
                         match = po_row
                         break
-                        
-            new_row = {col: None for col in df_excel.columns}
-            new_row[item_col_name] = excel_item
+            
+            # Formulate the matched PDF dictionary row
+            pdf_side_row = {col: None for col in df_excel.columns}
+            pdf_side_row['Data Block Source'] = 'PDF Extracted (PO Check Zone)'
+            pdf_side_row[item_col_name] = excel_item
             
             if match is not None:
-                if 'Line' in df_excel.columns: new_row['Line'] = match.get('Line')
-                if 'Unit Price' in df_excel.columns: new_row['Unit Price'] = match.get('Unit_Price')
-                if 'Required Date/Time' in df_excel.columns: new_row['Required Date/Time'] = match.get('Required_Date')
-                if 'Order Quantity' in df_excel.columns: new_row['Order Quantity'] = match.get('Order_Quantity')
-                new_row[unnamed_col] = match.get('Description', 'No Description')
-                if 'Notes' in df_excel.columns: new_row['Notes'] = f"Extracted from PDF: {match.get('PO_Source_File', '')}"
+                if 'Line' in df_excel.columns: pdf_side_row['Line'] = match.get('Line')
+                if 'Unit Price' in df_excel.columns: pdf_side_row['Unit Price'] = match.get('Unit_Price')
+                if 'Required Date/Time' in df_excel.columns: pdf_side_row['Required Date/Time'] = parse_date_to_custom_format(match.get('Required_Date'))
+                if 'Order Quantity' in df_excel.columns: pdf_side_row['Order Quantity'] = match.get('Order_Quantity')
+                pdf_side_row[unnamed_col] = match.get('Description', 'No Description')
+                if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = f"Extracted from PDF: {match.get('PO_Source_File', '')}"
             else:
-                if 'Notes' in df_excel.columns: new_row['Notes'] = "Not found in PO PDF"
-                    
-            pdf_rows.append(new_row)
+                if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = "Not found in PO PDF"
+            
+            # Empty spacer dict row
+            blank_spacer_row = {col: None for col in df_excel.columns}
+            blank_spacer_row['Data Block Source'] = None
+            
+            # Append rows strictly adhering to requested repeating layout pattern
+            structured_rows.append(excel_side_row)
+            structured_rows.append(pdf_side_row)
+            structured_rows.append(blank_spacer_row)
 
-        df_pdf = pd.DataFrame(pdf_rows)
-        df_excel.insert(0, 'Data Block Source', 'Excel A (System Master Data)')
-        df_pdf.insert(0, 'Data Block Source', 'PDF Extracted (PO Check Zone)')
-        spacer_row = pd.DataFrame([{col: None for col in df_excel.columns}])
-        df_final = pd.concat([df_excel, spacer_row, df_pdf], ignore_index=True)
+        df_final = pd.DataFrame(structured_rows)
         
+        # Shift Data Block Source identification tags column to the far front
+        cols = ['Data Block Source'] + [c for c in df_final.columns if c != 'Data Block Source']
+        df_final = df_final[cols]
         df_final.to_excel(OUTPUT_FILENAME, index=False)
 
-        # Highlight Mismatches using OpenPyXL
+        # Highlight Mismatches sequentially via OpenPyXL cell indexing
         wb = openpyxl.load_workbook(OUTPUT_FILENAME)
         ws = wb.active
         headers = [cell.value for cell in ws[1]]
@@ -225,11 +228,11 @@ if excel_file and pdf_files:
         idx_date = headers.index('Required Date/Time') + 1 if 'Required Date/Time' in headers else None
 
         fill_red = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
-        n_records = len(df_excel)
-
-        for i in range(n_records):
-            row_excel_idx = i + 2
-            row_pdf_idx = i + 3 + n_records
+        
+        # Loop over items step skipping by 3 to evaluate adjacent pairs 
+        for i in range(len(df_excel)):
+            row_excel_idx = (i * 3) + 2
+            row_pdf_idx = (i * 3) + 3
             
             if idx_line:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_line), ws.cell(row=row_pdf_idx, column=idx_line)
@@ -248,7 +251,7 @@ if excel_file and pdf_files:
                     
             if idx_date:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_date), ws.cell(row=row_pdf_idx, column=idx_date)
-                if parse_date(cell_e.value) != parse_date(cell_p.value) and cell_p.value is not None:
+                if cell_e.value != cell_p.value and cell_p.value is not None and cell_p.value != "":
                     cell_e.fill = fill_red; cell_p.fill = fill_red
 
         excel_buffer = io.BytesIO()
@@ -256,7 +259,6 @@ if excel_file and pdf_files:
         excel_buffer.seek(0)
 
         st.success("🎉 Process Complete!")
-        
         st.download_button(
             label="📥 Download Discrepancy Report",
             data=excel_buffer,
