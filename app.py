@@ -26,10 +26,14 @@ if not GOOGLE_API_KEY:
 client = genai.Client(api_key=GOOGLE_API_KEY)
 OUTPUT_FILENAME = "PO_Checking_Report.xlsx"
 
-# Helper function to remove spaces/hyphens/dots for matching keys
+# ADVANCED matching cleanup helper to handle revision suffixes (e.g., rev01, rev03)
 def clean_key(val):
     if pd.isna(val) or val is None: return ""
-    return str(val).replace(" ", "").replace("-", "").replace(".", "").lower().strip()
+    s = str(val).replace(" ", "").replace("-", "").replace(".", "").lower().strip()
+    # If the string contains 'rev', truncate everything after it to isolate the core base part number
+    if 'rev' in s:
+        s = s.split('rev')[0].strip()
+    return s
 
 # Standardize line numbers
 def clean_line_num(val):
@@ -92,10 +96,10 @@ if excel_file and pdf_files:
         po_item_schema = types.Schema(
             type=types.Type.OBJECT,
             properties={
-                "Line": types.Schema(type=types.Type.STRING, description="The sequence position or row index number, e.g. '1', '2', '3', '7'"),
+                "Line": types.Schema(type=types.Type.STRING, description="The sequence position or row index number, e.g. '1', '2', '3', '7', '8'"),
                 "Item": types.Schema(
                     type=types.Type.STRING, 
-                    description="The core drawing number or material code string (e.g. '1237190 Rev: 01', '1117622.B'). Check both the first column and the description column to capture this code properly."
+                    description="The core drawing number or material code string (e.g. '1237190 Rev: 01', '1237200'). Examine stacked column structures to completely extract this value."
                 ),
                 "Description": types.Schema(type=types.Type.STRING, description="Product item text name description"),
                 "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity numerical value count"),
@@ -110,16 +114,16 @@ if excel_file and pdf_files:
             items=po_item_schema
         )
 
-        # Enhanced prompt instructions specifically addressing text-reversals
+        # Enhanced multi-item column unpacking layout rules
         prompt = """
-        You are a meticulous purchase order parsing specialist. 
-        This PDF document has structural quirks where labels and tables are vertically stacked or inverted:
+        You are a meticulous purchase order parsing specialist working with multi-line aggregated layouts.
+        This PDF documents text-tracks by grouping multiple records vertically in single rows.
         
         CRITICAL EXTRACTION RULES:
-        1. Look closely at the first column ('Pos. Tekening'). It often contains BOTH the line sequence number AND the item drawing code together (e.g., '7 \\n\\n\\n 1237190 Rev: 01'). Extract the drawing/part code cleanly!
-        2. In the description column, the label 'Item' is frequently written BELOW the item number code (e.g., ': 1237190 \\n Item'). Do not miss it—the code string directly above the word 'Item' is the correct part number.
-        3. Look closely at blocks where multiple line numbers, quantities, or prices are listed together (e.g. 10, 1, 6). Unpack them sequentially so that every single part code gets its own unique JSON object.
-        4. Extract the 'Delivery Date' associated with each respective item block.
+        1. Look closely at grouped lines (e.g., lines 3, 4, 5 or lines 8, 10). The item codes, line numbers, quantities, and prices are listed sequentially separated by newlines in single column blocks. 
+           YOU MUST UNPACK THEM completely! Split them up so that every individual item code gets its own separate JSON object in the output list.
+        2. Clean and capture the specific 'Order Quantity', 'Unit Price', and 'Delivery Date' fields associated with that item sequence rank position.
+        3. Extract the item part numbers wherever they sit (checking both the column headers and descriptions text blocks).
         """
 
         all_po_items = []
@@ -166,8 +170,7 @@ if excel_file and pdf_files:
         df_po = pd.DataFrame(all_po_items)
         st.write("🔄 Alternating and structuring report layout rows...")
 
-        # Build precise custom alternated mapping matrix block:
-        # [Excel Row] -> [PDF Row] -> [Blank Spacer Row] -> Repeat
+        # Build precise custom alternated mapping matrix block
         structured_rows = []
         
         for idx, row in df_excel.iterrows():
@@ -186,6 +189,7 @@ if excel_file and pdf_files:
                 for _, po_row in df_po.iterrows():
                     po_item = str(po_row.get('Item', '')).strip()
                     po_key = clean_key(po_item)
+                    # Cross-match checking containing relationships to secure split data items
                     if po_key and (po_key in excel_key or excel_key in po_key):
                         match = po_row
                         break
@@ -249,16 +253,15 @@ if excel_file and pdf_files:
                 if notes_val == "Not found in PO PDF":
                     is_missing_in_pdf = True
 
-            # Step 1: Base row color assignment (Yellow if missing, Gray if found)
+            # Base row color assignment (Yellow if missing, Gray if found)
             current_base_fill = fill_yellow if is_missing_in_pdf else fill_light_gray
             for col_idx in range(1, len(headers) + 1):
                 ws.cell(row=row_excel_idx, column=col_idx).fill = current_base_fill
 
-            # Step 2: Skip mismatch value checks if it wasn't even found in the PDF
             if is_missing_in_pdf:
                 continue
 
-            # Step 3: Run Value Discrepancy Checks (Mismatches override base colors with red)
+            # Run Value Discrepancy Checks (Mismatches override base colors with red)
             if idx_line:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_line), ws.cell(row=row_pdf_idx, column=idx_line)
                 if clean_line_num(cell_e.value) != clean_line_num(cell_p.value) and cell_p.value is not None:
