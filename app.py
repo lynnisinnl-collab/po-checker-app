@@ -136,7 +136,7 @@ if excel_file and pdf_files:
 
                 # --- PROTECTED API CALL WITH EMBEDDED RETRY LOGIC ---
                 max_retries = 4
-                retry_delay = 4  # Start with a 4 second delay
+                retry_delay = 4  
                 response = None
                 
                 for attempt in range(max_retries):
@@ -153,16 +153,16 @@ if excel_file and pdf_files:
                                 temperature=0.0
                             )
                         )
-                        break  # Successfully generated content, break out of retry loop
+                        break  
                     except Exception as api_err:
                         err_msg = str(api_err)
                         if "503" in err_msg or "UNAVAILABLE" in err_msg:
                             if attempt < max_retries - 1:
                                 st.warning(f"⏳ Server overloaded (503). Retrying file {pdf_file.name} in {retry_delay}s... (Attempt {attempt + 1}/{max_retries})")
                                 time.sleep(retry_delay)
-                                retry_delay *= 2  # Double the wait time for the next attempt (exponential backoff)
+                                retry_delay *= 2  
                                 continue
-                        raise api_err  # If it's a critical non-503 error, pass it to the main block
+                        raise api_err  
                 
                 items_data = json.loads(response.text.strip())
                 for item in items_data:
@@ -236,13 +236,19 @@ if excel_file and pdf_files:
                 if (ex_line == pdf_line and ex_qty == pdf_qty and ex_price == pdf_price and ex_date == pdf_date and ex_date != ""):
                     today_str = datetime.now().strftime("%d%m")
                     
+                    # --- UPDATED DATE STRIPPER LOGIC (DDMMYY) ---
                     if '/' in ex_date:
                         date_parts = ex_date.split('/')
-                        delivery_ddmm = date_parts[0] + date_parts[1]
+                        # date_parts[0]=DD, date_parts[1]=MM, date_parts[2]=YYYY. [-2:] extracts just the last 2 digits of the year.
+                        delivery_ddmmyy = date_parts[0] + date_parts[1] + date_parts[2][-2:]
                     else:
-                        delivery_ddmm = "".join([c for c in ex_date if c.isdigit()][:4])
+                        digits = "".join([c for c in ex_date if c.isdigit()])
+                        if len(digits) >= 8:
+                            delivery_ddmmyy = digits[:4] + digits[-2:]
+                        else:
+                            delivery_ddmmyy = digits[:6]
                         
-                    confirmation_note_text = f"{today_str} LL confirmed delivery date {delivery_ddmm}"
+                    confirmation_note_text = f"{today_str} LL confirmed delivery date {delivery_ddmmyy}"
             else:
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = "Not found in PO PDF"
             
