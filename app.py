@@ -92,8 +92,11 @@ if excel_file and pdf_files:
         po_item_schema = types.Schema(
             type=types.Type.OBJECT,
             properties={
-                "Line": types.Schema(type=types.Type.STRING, description="The sequence position, e.g. '1', '2', '3'"),
-                "Item": types.Schema(type=types.Type.STRING, description="The drawing number or item string like '00497-00552-B' or '1117622.B'"),
+                "Line": types.Schema(type=types.Type.STRING, description="The sequence position or row index number, e.g. '1', '2', '3', '7'"),
+                "Item": types.Schema(
+                    type=types.Type.STRING, 
+                    description="The core drawing number or material code string (e.g. '1237190 Rev: 01', '1117622.B'). Check both the first column and the description column to capture this code properly."
+                ),
                 "Description": types.Schema(type=types.Type.STRING, description="Product item text name description"),
                 "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity numerical value count"),
                 "Unit_Price": types.Schema(type=types.Type.STRING, description="Price per piece numeric value"),
@@ -107,15 +110,16 @@ if excel_file and pdf_files:
             items=po_item_schema
         )
 
+        # Enhanced prompt instructions specifically addressing text-reversals
         prompt = """
         You are a meticulous purchase order parsing specialist. 
-        This PDF document stacks data values vertically across text blocks. 
-        Carefully associate each 'Item' (Drawing code/Part number) with its correct corresponding sequence order properties.
+        This PDF document has structural quirks where labels and tables are vertically stacked or inverted:
         
-        CRITICAL RULES:
-        1. Look closely at blocks where multiple line numbers, quantities, or prices are listed together (e.g. 10, 1, 6). Unpack them step-by-step so that every distinct Item code gets its own unique object block.
-        2. Clean and capture the exact base 'Order Quantity' and 'Unit Price' values.
-        3. Extract the 'Delivery Date' associated with that item block.
+        CRITICAL EXTRACTION RULES:
+        1. Look closely at the first column ('Pos. Tekening'). It often contains BOTH the line sequence number AND the item drawing code together (e.g., '7 \\n\\n\\n 1237190 Rev: 01'). Extract the drawing/part code cleanly!
+        2. In the description column, the label 'Item' is frequently written BELOW the item number code (e.g., ': 1237190 \\n Item'). Do not miss it—the code string directly above the word 'Item' is the correct part number.
+        3. Look closely at blocks where multiple line numbers, quantities, or prices are listed together (e.g. 10, 1, 6). Unpack them sequentially so that every single part code gets its own unique JSON object.
+        4. Extract the 'Delivery Date' associated with each respective item block.
         """
 
         all_po_items = []
@@ -231,7 +235,7 @@ if excel_file and pdf_files:
         # Style Fills
         fill_red = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
         fill_light_gray = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')
-        fill_yellow = PatternFill(start_color='FFFFCC', end_color='FFFFCC', fill_type='solid') # Soft warning yellow
+        fill_yellow = PatternFill(start_color='FFFFCC', end_color='FFFFCC', fill_type='solid')
         
         # Loop over items step skipping by 3 to evaluate adjacent pairs 
         for i in range(len(df_excel)):
