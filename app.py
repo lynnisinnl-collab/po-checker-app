@@ -124,6 +124,7 @@ if excel_file and pdf_files:
 
         all_po_items = []
         progress_bar = st.progress(0)
+        quota_exhausted = False
         
         for idx, pdf_file in enumerate(pdf_files):
             st.write(f"🔍 AI is processing: **{pdf_file.name}**")
@@ -156,6 +157,14 @@ if excel_file and pdf_files:
                         break  
                     except Exception as api_err:
                         err_msg = str(api_err)
+                        
+                        # Handle Hard Daily Limit Cap Exceeded
+                        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                            st.error("🛑 **Daily Quota Limit Reached (429)!** Your Gemini Free Tier account allows a maximum of 20 requests per day. To remove this limit, switch your project to Pay-As-You-Go billing in Google AI Studio, or use an API Key from a different Google account.")
+                            quota_exhausted = True
+                            break
+                        
+                        # Handle Server Busy
                         if "503" in err_msg or "UNAVAILABLE" in err_msg:
                             if attempt < max_retries - 1:
                                 st.warning(f"⏳ Server overloaded (503). Retrying file {pdf_file.name} in {retry_delay}s... (Attempt {attempt + 1}/{max_retries})")
@@ -164,6 +173,9 @@ if excel_file and pdf_files:
                                 continue
                         raise api_err  
                 
+                if quota_exhausted:
+                    st.stop()
+                    
                 items_data = json.loads(response.text.strip())
                 for item in items_data:
                     item['PO_Source_File'] = pdf_file.name
@@ -184,21 +196,19 @@ if excel_file and pdf_files:
         st.write("🔄 Alternating and structuring report layout rows...")
 
         structured_rows = []
-        used_po_indices = set() # Track matched rows to handle duplicate part numbers gracefully
+        used_po_indices = set() 
         
         for idx, row in df_excel.iterrows():
             excel_item = str(row.get(item_col_name, '')).strip()
             excel_key = clean_key(excel_item)
             ex_line = clean_line_num(row.get('Line'))
             
-            # Formulate the Excel baseline dictionary row
             excel_side_row = {col: row[col] for col in df_excel.columns}
             excel_side_row['Data Block Source'] = 'Excel A (System Master Data)'
             
             if 'Required Date/Time' in excel_side_row:
                 excel_side_row['Required Date/Time'] = parse_date_to_custom_format(excel_side_row['Required Date/Time'])
             
-            # --- ADVANCED LINE-AWARE MATCHING ENGINE ---
             match = None
             if not df_po.empty and excel_key:
                 candidates = []
@@ -207,39 +217,30 @@ if excel_file and pdf_files:
                     po_key = clean_key(po_item)
                     po_desc_key = clean_key(po_row.get('Description', ''))
                     
-                    # Group check: Match by key or if item is nested inside description text
                     if (po_key and (po_key in excel_key or excel_key in po_key)) or (excel_key and excel_key in po_desc_key):
                         candidates.append((po_idx, po_row))
                 
                 if candidates:
-                    # Pass 1: Prioritize exact line matching position that hasn't been claimed yet
                     for po_idx, po_row in candidates:
                         if clean_line_num(po_row.get('Line')) == ex_line and po_idx not in used_po_indices:
                             match = po_row
                             used_po_indices.add(po_idx)
                             break
-                    
-                    # Pass 2: Exact line number fallback even if claimed
                     if match is None:
                         for po_idx, po_row in candidates:
                             if clean_line_num(po_row.get('Line')) == ex_line:
                                 match = po_row
                                 used_po_indices.add(po_idx)
                                 break
-                    
-                    # Pass 3: Unused candidate matching drawing number fallback
                     if match is None:
                         for po_idx, po_row in candidates:
                             if po_idx not in used_po_indices:
                                 match = po_row
                                 used_po_indices.add(po_idx)
                                 break
-                    
-                    # Pass 4: Absolute first available candidate item match
                     if match is None:
                         match = candidates[0][1]
 
-            # Formulate the matched PDF dictionary row
             pdf_side_row = {col: None for col in df_excel.columns}
             pdf_side_row['Data Block Source'] = 'PDF Extracted (PO Check Zone)'
             pdf_side_row[item_col_name] = excel_item
