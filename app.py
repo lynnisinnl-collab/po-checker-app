@@ -131,7 +131,7 @@ if excel_file and pdf_files:
                     continue
 
                 response = client.models.generate_content(
-                    model='gemini-2.5-flash',
+                    model='gemini-1.5-flash',
                     contents=[
                         types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'),
                         prompt
