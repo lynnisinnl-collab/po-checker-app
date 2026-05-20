@@ -226,21 +226,35 @@ if excel_file and pdf_files:
         idx_qty = headers.index('Order Quantity') + 1 if 'Order Quantity' in headers else None
         idx_price = headers.index('Unit Price') + 1 if 'Unit Price' in headers else None
         idx_date = headers.index('Required Date/Time') + 1 if 'Required Date/Time' in headers else None
+        idx_notes = headers.index('Notes') + 1 if 'Notes' in headers else None
 
         # Style Fills
         fill_red = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
         fill_light_gray = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')
+        fill_yellow = PatternFill(start_color='FFFFCC', end_color='FFFFCC', fill_type='solid') # Soft warning yellow
         
         # Loop over items step skipping by 3 to evaluate adjacent pairs 
         for i in range(len(df_excel)):
             row_excel_idx = (i * 3) + 2
             row_pdf_idx = (i * 3) + 3
             
-            # Apply light gray background background to the entire Excel base row
-            for col_idx in range(1, len(headers) + 1):
-                ws.cell(row=row_excel_idx, column=col_idx).fill = fill_light_gray
+            # Check if the row was missing in the PDF
+            is_missing_in_pdf = False
+            if idx_notes:
+                notes_val = ws.cell(row=row_pdf_idx, column=idx_notes).value
+                if notes_val == "Not found in PO PDF":
+                    is_missing_in_pdf = True
 
-            # Check Discrepancies (Mismatches will override the gray/white with red alert fill)
+            # Step 1: Base row color assignment (Yellow if missing, Gray if found)
+            current_base_fill = fill_yellow if is_missing_in_pdf else fill_light_gray
+            for col_idx in range(1, len(headers) + 1):
+                ws.cell(row=row_excel_idx, column=col_idx).fill = current_base_fill
+
+            # Step 2: Skip mismatch value checks if it wasn't even found in the PDF
+            if is_missing_in_pdf:
+                continue
+
+            # Step 3: Run Value Discrepancy Checks (Mismatches override base colors with red)
             if idx_line:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_line), ws.cell(row=row_pdf_idx, column=idx_line)
                 if clean_line_num(cell_e.value) != clean_line_num(cell_p.value) and cell_p.value is not None:
