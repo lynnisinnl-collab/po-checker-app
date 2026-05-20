@@ -184,10 +184,12 @@ if excel_file and pdf_files:
         st.write("🔄 Alternating and structuring report layout rows...")
 
         structured_rows = []
+        used_po_indices = set() # Track matched rows to handle duplicate part numbers gracefully
         
         for idx, row in df_excel.iterrows():
             excel_item = str(row.get(item_col_name, '')).strip()
             excel_key = clean_key(excel_item)
+            ex_line = clean_line_num(row.get('Line'))
             
             # Formulate the Excel baseline dictionary row
             excel_side_row = {col: row[col] for col in df_excel.columns}
@@ -196,16 +198,47 @@ if excel_file and pdf_files:
             if 'Required Date/Time' in excel_side_row:
                 excel_side_row['Required Date/Time'] = parse_date_to_custom_format(excel_side_row['Required Date/Time'])
             
-            # Search for the extracted PDF item match
+            # --- ADVANCED LINE-AWARE MATCHING ENGINE ---
             match = None
             if not df_po.empty and excel_key:
-                for _, po_row in df_po.iterrows():
+                candidates = []
+                for po_idx, po_row in df_po.iterrows():
                     po_item = str(po_row.get('Item', '')).strip()
                     po_key = clean_key(po_item)
-                    if po_key and (po_key in excel_key or excel_key in po_key):
-                        match = po_row
-                        break
-            
+                    po_desc_key = clean_key(po_row.get('Description', ''))
+                    
+                    # Group check: Match by key or if item is nested inside description text
+                    if (po_key and (po_key in excel_key or excel_key in po_key)) or (excel_key and excel_key in po_desc_key):
+                        candidates.append((po_idx, po_row))
+                
+                if candidates:
+                    # Pass 1: Prioritize exact line matching position that hasn't been claimed yet
+                    for po_idx, po_row in candidates:
+                        if clean_line_num(po_row.get('Line')) == ex_line and po_idx not in used_po_indices:
+                            match = po_row
+                            used_po_indices.add(po_idx)
+                            break
+                    
+                    # Pass 2: Exact line number fallback even if claimed
+                    if match is None:
+                        for po_idx, po_row in candidates:
+                            if clean_line_num(po_row.get('Line')) == ex_line:
+                                match = po_row
+                                used_po_indices.add(po_idx)
+                                break
+                    
+                    # Pass 3: Unused candidate matching drawing number fallback
+                    if match is None:
+                        for po_idx, po_row in candidates:
+                            if po_idx not in used_po_indices:
+                                match = po_row
+                                used_po_indices.add(po_idx)
+                                break
+                    
+                    # Pass 4: Absolute first available candidate item match
+                    if match is None:
+                        match = candidates[0][1]
+
             # Formulate the matched PDF dictionary row
             pdf_side_row = {col: None for col in df_excel.columns}
             pdf_side_row['Data Block Source'] = 'PDF Extracted (PO Check Zone)'
@@ -221,25 +254,19 @@ if excel_file and pdf_files:
                 pdf_side_row[unnamed_col] = match.get('Description', 'No Description')
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = f"Extracted from PDF: {match.get('PO_Source_File', '')}"
                 
-                ex_line = clean_line_num(row.get('Line'))
                 pdf_line = clean_line_num(match.get('Line'))
-                
                 ex_qty = normalize_numeric(row.get('Order Quantity'))
                 pdf_qty = normalize_numeric(match.get('Order_Quantity'))
-                
                 ex_price = normalize_numeric(row.get('Unit Price'))
                 pdf_price = normalize_numeric(match.get('Unit_Price'))
-                
                 ex_date = parse_date_to_custom_format(row.get('Required Date/Time'))
                 pdf_date = parse_date_to_custom_format(match.get('Required_Date'))
                 
                 if (ex_line == pdf_line and ex_qty == pdf_qty and ex_price == pdf_price and ex_date == pdf_date and ex_date != ""):
                     today_str = datetime.now().strftime("%d%m")
                     
-                    # --- UPDATED DATE STRIPPER LOGIC (DDMMYY) ---
                     if '/' in ex_date:
                         date_parts = ex_date.split('/')
-                        # date_parts[0]=DD, date_parts[1]=MM, date_parts[2]=YYYY. [-2:] extracts just the last 2 digits of the year.
                         delivery_ddmmyy = date_parts[0] + date_parts[1] + date_parts[2][-2:]
                     else:
                         digits = "".join([c for c in ex_date if c.isdigit()])
