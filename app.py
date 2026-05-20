@@ -3,7 +3,8 @@ import json
 import io
 import time  
 import pandas as pd
-from google import genai  # Fix: Using the brand new official Google GenAI SDK
+from google import genai  
+from google.genai import types  # Import types for response_schema
 import openpyxl
 from openpyxl.styles import PatternFill
 import streamlit as st
@@ -15,14 +16,13 @@ st.set_page_config(page_title="PO Checker AI", layout="centered")
 st.title("📦 Purchase Order Checking Assistant")
 st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report.")
 
-# Securely fetch API key from environment or Streamlit secrets
+# Securely fetch API key
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY") or st.secrets.get("GOOGLE_API_KEY", "")
 
 if not GOOGLE_API_KEY:
     st.error("🔑 Google API Key not found! Please configure it in your environment or secrets.")
     st.stop()
 
-# Fix: Initialize the modern GenAI Client
 client = genai.Client(api_key=GOOGLE_API_KEY)
 OUTPUT_FILENAME = "PO_Checking_Report.xlsx"
 
@@ -35,7 +35,7 @@ pdf_files = st.file_uploader("👉 Step 2: Upload PO PDF file(s)", type=["pdf"],
 # Helper function to remove spaces/hyphens
 def clean_key(val):
     if pd.isna(val) or val is None: return ""
-    return str(val).replace(" ", "").replace("-", "").lower().strip()
+    return str(val).replace(" ", "").replace("-", "").replace(".", "").lower().strip()
 
 # Standardize line numbers
 def clean_line_num(val):
@@ -75,7 +75,12 @@ if excel_file and pdf_files:
             
         df_excel.columns = df_excel.columns.astype(str).str.strip()
 
-        # Detect/create target description column
+        # Dynamically discover the primary Item Identification column in Master Data
+        # (Handles columns called 'Item', 'Material', 'Part Number', etc.)
+        item_col_name = next((c for c in df_excel.columns if c.lower() in ['item', 'item number', 'material', 'part no', 'part number']), 'Item')
+        if item_col_name not in df_excel.columns and len(df_excel.columns) > 0:
+            item_col_name = df_excel.columns[0] # Fallback to first column
+
         unnamed_col = None
         cols_list = list(df_excel.columns)
         if 'Notes' in cols_list:
@@ -87,37 +92,43 @@ if excel_file and pdf_files:
 
         if not unnamed_col:
             unnamed_col = next((c for c in df_excel.columns if 'Unnamed' in c), 'Unnamed: 5')
-            if unnamed_col not in df_excel.columns:
+            if unnamed_col not in df_excel.columns and 'Notes' in cols_list:
                 df_excel.insert(cols_list.index('Notes') + 1, unnamed_col, None)
+            elif unnamed_col not in df_excel.columns:
+                df_excel[unnamed_col] = None
 
-        # ==========================================
-        # Modern AI PDF Parsing Block
-        # ==========================================
+        # Define the exact layout schema we want Gemini to return
+        po_item_schema = types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "Line": types.Schema(type=types.Type.STRING, description="The position or item number sequence, e.g., '0001', '1', '2'"),
+                "Item": types.Schema(type=types.Type.STRING, description="The core Drawing ID, Material Code, or Item identifier string (e.g. '00497-00552-B', '1117622.B')"),
+                "Description": types.Schema(type=types.Type.STRING, description="Textual description of the line item"),
+                "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity ordered"),
+                "Unit_Price": types.Schema(type=types.Type.STRING, description="Unit price amount"),
+                "Required_Date": types.Schema(type=types.Type.STRING, description="Target Delivery/Required Date found near the item block in YYYY-MM-DD format")
+            },
+            required=["Line", "Item", "Order_Quantity", "Unit_Price"]
+        )
+
+        final_response_schema = types.Schema(
+            type=types.Type.ARRAY,
+            items=po_item_schema
+        )
+
         prompt = """
-        You are a purchase order parsing expert. Read the PDF purchase order and extract all "Line Items".
-        Output ONLY a valid standard JSON Array. Do NOT include markdown syntax (like ```json) or any extra text. And consider required date might be named as delivery date.
-
-        Required JSON Structure:
-        [
-          {
-            "Line": "0001",
-            "Item": "Product item number or material code",
-            "Description": "Product name / text description",
-            "Order Quantity": "100", 
-            "Unit Price": "50.5",
-            "Required Date/Time": "2026-08-03"
-          }
-        ]
+        You are an expert procurement analyst. Read the attached purchase order document.
+        Carefully parse out every individual line item. Note that tables might span across pages 
+        and line items or descriptions may be wrapped into multi-line blocks or stacked rows.
+        Isolate each part code/drawing index, matching it strictly with its respective quantity, unit price, and delivery date.
         """
 
         all_po_items = []
-        
-        # Display progress status dynamically in the UI
         progress_bar = st.progress(0)
+        
         for idx, pdf_file in enumerate(pdf_files):
             st.write(f"🔍 AI is processing: **{pdf_file.name}**")
             try:
-                # Reset stream buffer pointer before reading
                 pdf_file.seek(0)
                 pdf_bytes = pdf_file.read()
                 
@@ -125,24 +136,21 @@ if excel_file and pdf_files:
                     st.error(f"⚠️ File data for {pdf_file.name} was read empty. Skipping...")
                     continue
 
-                # Fix: Modern payload formatting structure for the new client
+                # Use official configuration options to handle Structured JSON Outputs safely
                 response = client.models.generate_content(
                     model='gemini-2.5-flash',
                     contents=[
-                        genai.types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'),
+                        types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'),
                         prompt
-                    ]
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=final_response_schema,
+                        temperature=0.1 # Low temp enforces high extraction accuracy
+                    )
                 )
-                raw_text = response.text.strip()
                 
-                start_idx = raw_text.find('[')
-                end_idx = raw_text.rfind(']') + 1
-                if start_idx != -1 and end_idx != 0:
-                    raw_text = raw_text[start_idx:end_idx]
-                    
-                items_data = json.loads(raw_text)
-                if isinstance(items_data, dict):
-                    items_data = [items_data]
+                items_data = json.loads(response.text.strip())
                     
                 for item in items_data:
                     item['PO_Source_File'] = pdf_file.name
@@ -150,48 +158,47 @@ if excel_file and pdf_files:
                     
             except Exception as e:
                 if "429" in str(e) or "quota" in str(e).lower():
-                    st.error(f"⚠️ Hit Google's speed limit on {pdf_file.name}. Pausing to reset...")
+                    st.error(f"⚠️ Rate limit reached on {pdf_file.name}. Pausing...")
                     time.sleep(15) 
                 else:
                     st.error(f"❌ Failed to parse {pdf_file.name}: {e}")
             
             progress_bar.progress((idx + 1) / len(pdf_files))
             
-            # Rate-limiting cushion
             if idx < len(pdf_files) - 1:
-                with st.spinner("⏳ Waiting 12 seconds to respect Gemini Free Tier limits..."):
-                    time.sleep(12)
+                time.sleep(5) # Lowered wait step because official JSON mode reduces payload failure rates
 
         if not all_po_items:
             st.error("❌ No data was successfully extracted from your PDF(s). Processing stopped.")
             st.stop()
 
         df_po = pd.DataFrame(all_po_items)
-        st.write("🔄 Generating block-comparison report...")
+        st.write("🔄 Generating cross-comparison tracking report...")
 
         # Match Mapping Logic
         pdf_rows = []
         for idx, row in df_excel.iterrows():
-            excel_item = str(row.get('Item', '')).strip()
+            excel_item = str(row.get(item_col_name, '')).strip()
             excel_key = clean_key(excel_item)
             
             match = None
-            if not df_po.empty:
+            if not df_po.empty and excel_key:
                 for _, po_row in df_po.iterrows():
                     po_item = str(po_row.get('Item', '')).strip()
                     po_key = clean_key(po_item)
+                    # Cross-string containing check to clean up mixed formats
                     if po_key and (po_key in excel_key or excel_key in po_key):
                         match = po_row
                         break
                         
             new_row = {col: None for col in df_excel.columns}
-            new_row['Item'] = excel_item
+            new_row[item_col_name] = excel_item
             
             if match is not None:
                 if 'Line' in df_excel.columns: new_row['Line'] = match.get('Line')
-                if 'Unit Price' in df_excel.columns: new_row['Unit Price'] = match.get('Unit Price')
-                if 'Required Date/Time' in df_excel.columns: new_row['Required Date/Time'] = match.get('Required Date/Time')
-                if 'Order Quantity' in df_excel.columns: new_row['Order Quantity'] = match.get('Order Quantity')
+                if 'Unit Price' in df_excel.columns: new_row['Unit Price'] = match.get('Unit_Price')
+                if 'Required Date/Time' in df_excel.columns: new_row['Required Date/Time'] = match.get('Required_Date')
+                if 'Order Quantity' in df_excel.columns: new_row['Order Quantity'] = match.get('Order_Quantity')
                 new_row[unnamed_col] = match.get('Description', 'No Description')
                 if 'Notes' in df_excel.columns: new_row['Notes'] = f"Extracted from PDF: {match.get('PO_Source_File', '')}"
             else:
