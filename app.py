@@ -2,6 +2,7 @@ import os
 import json
 import io
 import time  
+from datetime import datetime
 import pandas as pd
 from google import genai  
 from google.genai import types  
@@ -14,7 +15,7 @@ import streamlit as st
 # ==========================================
 st.set_page_config(page_title="PO Checker AI", layout="centered")
 st.title("📦 Purchase Order Checking Assistant")
-st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report.")
+st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report with matching confirmation notes.")
 
 # Securely fetch API key
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY") or st.secrets.get("GOOGLE_API_KEY", "")
@@ -26,11 +27,10 @@ if not GOOGLE_API_KEY:
 client = genai.Client(api_key=GOOGLE_API_KEY)
 OUTPUT_FILENAME = "PO_Checking_Report.xlsx"
 
-# ADVANCED matching cleanup helper to handle revision suffixes (e.g., rev01, rev03)
+# Advanced matching cleanup helper to handle revision suffixes (e.g., rev01, rev03)
 def clean_key(val):
     if pd.isna(val) or val is None: return ""
     s = str(val).replace(" ", "").replace("-", "").replace(".", "").lower().strip()
-    # If the string contains 'rev', truncate everything after it to isolate the core base part number
     if 'rev' in s:
         s = s.split('rev')[0].strip()
     return s
@@ -97,10 +97,7 @@ if excel_file and pdf_files:
             type=types.Type.OBJECT,
             properties={
                 "Line": types.Schema(type=types.Type.STRING, description="The sequence position or row index number, e.g. '1', '2', '3', '7', '8'"),
-                "Item": types.Schema(
-                    type=types.Type.STRING, 
-                    description="The core drawing number or material code string (e.g. '1237190 Rev: 01', '1237200'). Examine stacked column structures to completely extract this value."
-                ),
+                "Item": types.Schema(type=types.Type.STRING, description="The drawing number or item string like '1237190 Rev: 01'"),
                 "Description": types.Schema(type=types.Type.STRING, description="Product item text name description"),
                 "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity numerical value count"),
                 "Unit_Price": types.Schema(type=types.Type.STRING, description="Price per piece numeric value"),
@@ -114,7 +111,6 @@ if excel_file and pdf_files:
             items=po_item_schema
         )
 
-        # Enhanced multi-item column unpacking layout rules
         prompt = """
         You are a meticulous purchase order parsing specialist working with multi-line aggregated layouts.
         This PDF documents text-tracks by grouping multiple records vertically in single rows.
@@ -170,7 +166,6 @@ if excel_file and pdf_files:
         df_po = pd.DataFrame(all_po_items)
         st.write("🔄 Alternating and structuring report layout rows...")
 
-        # Build precise custom alternated mapping matrix block
         structured_rows = []
         
         for idx, row in df_excel.iterrows():
@@ -180,6 +175,7 @@ if excel_file and pdf_files:
             # Formulate the Excel baseline dictionary row
             excel_side_row = {col: row[col] for col in df_excel.columns}
             excel_side_row['Data Block Source'] = 'Excel A (System Master Data)'
+            
             if 'Required Date/Time' in excel_side_row:
                 excel_side_row['Required Date/Time'] = parse_date_to_custom_format(excel_side_row['Required Date/Time'])
             
@@ -189,7 +185,6 @@ if excel_file and pdf_files:
                 for _, po_row in df_po.iterrows():
                     po_item = str(po_row.get('Item', '')).strip()
                     po_key = clean_key(po_item)
-                    # Cross-match checking containing relationships to secure split data items
                     if po_key and (po_key in excel_key or excel_key in po_key):
                         match = po_row
                         break
@@ -199,6 +194,9 @@ if excel_file and pdf_files:
             pdf_side_row['Data Block Source'] = 'PDF Extracted (PO Check Zone)'
             pdf_side_row[item_col_name] = excel_item
             
+            # Initialize the custom confirmation note logic string
+            confirmation_note_text = ""
+            
             if match is not None:
                 if 'Line' in df_excel.columns: pdf_side_row['Line'] = match.get('Line')
                 if 'Unit Price' in df_excel.columns: pdf_side_row['Unit Price'] = match.get('Unit_Price')
@@ -206,22 +204,53 @@ if excel_file and pdf_files:
                 if 'Order Quantity' in df_excel.columns: pdf_side_row['Order Quantity'] = match.get('Order_Quantity')
                 pdf_side_row[unnamed_col] = match.get('Description', 'No Description')
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = f"Extracted from PDF: {match.get('PO_Source_File', '')}"
+                
+                # --- AUTOMATED MATCH CONFIRMATION COLUMN LOGIC ---
+                ex_line = clean_line_num(row.get('Line'))
+                pdf_line = clean_line_num(match.get('Line'))
+                
+                ex_qty = normalize_numeric(row.get('Order Quantity'))
+                pdf_qty = normalize_numeric(match.get('Order_Quantity'))
+                
+                ex_price = normalize_numeric(row.get('Unit Price'))
+                pdf_price = normalize_numeric(match.get('Unit_Price'))
+                
+                ex_date = parse_date_to_custom_format(row.get('Required Date/Time'))
+                pdf_date = parse_date_to_custom_format(match.get('Required_Date'))
+                
+                # Validate if every field perfectly lines up across targets
+                if (ex_line == pdf_line and ex_qty == pdf_qty and ex_price == pdf_price and ex_date == pdf_date and ex_date != ""):
+                    today_str = datetime.now().strftime("%d%m") # Produces "2005"
+                    
+                    # Extract DDMM from the standardized date string (DD/MM/YYYY)
+                    if '/' in ex_date:
+                        date_parts = ex_date.split('/')
+                        delivery_ddmm = date_parts[0] + date_parts[1] # Produces "3009"
+                    else:
+                        delivery_ddmm = "".join([c for c in ex_date if c.isdigit()][:4])
+                        
+                    confirmation_note_text = f"{today_str} LL confirmed delivery date {delivery_ddmm}"
             else:
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = "Not found in PO PDF"
+            
+            # Assign confirmation note column data fields
+            excel_side_row['Confirmation Note'] = confirmation_note_text
+            pdf_side_row['Confirmation Note'] = confirmation_note_text
             
             # Empty spacer dict row
             blank_spacer_row = {col: None for col in df_excel.columns}
             blank_spacer_row['Data Block Source'] = None
+            blank_spacer_row['Confirmation Note'] = None
             
-            # Append rows strictly adhering to requested repeating layout pattern
             structured_rows.append(excel_side_row)
             structured_rows.append(pdf_side_row)
             structured_rows.append(blank_spacer_row)
 
         df_final = pd.DataFrame(structured_rows)
         
-        # Shift Data Block Source identification tags column to the far front
-        cols = ['Data Block Source'] + [c for c in df_final.columns if c != 'Data Block Source']
+        # Shift Data Block Source to the front, and position Confirmation Note exactly to the far right end
+        core_cols = [c for c in df_final.columns if c not in ['Data Block Source', 'Confirmation Note']]
+        cols = ['Data Block Source'] + core_cols + ['Confirmation Note']
         df_final = df_final[cols]
         df_final.to_excel(OUTPUT_FILENAME, index=False)
 
@@ -236,24 +265,20 @@ if excel_file and pdf_files:
         idx_date = headers.index('Required Date/Time') + 1 if 'Required Date/Time' in headers else None
         idx_notes = headers.index('Notes') + 1 if 'Notes' in headers else None
 
-        # Style Fills
         fill_red = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
         fill_light_gray = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')
         fill_yellow = PatternFill(start_color='FFFFCC', end_color='FFFFCC', fill_type='solid')
         
-        # Loop over items step skipping by 3 to evaluate adjacent pairs 
         for i in range(len(df_excel)):
             row_excel_idx = (i * 3) + 2
             row_pdf_idx = (i * 3) + 3
             
-            # Check if the row was missing in the PDF
             is_missing_in_pdf = False
             if idx_notes:
                 notes_val = ws.cell(row=row_pdf_idx, column=idx_notes).value
                 if notes_val == "Not found in PO PDF":
                     is_missing_in_pdf = True
 
-            # Base row color assignment (Yellow if missing, Gray if found)
             current_base_fill = fill_yellow if is_missing_in_pdf else fill_light_gray
             for col_idx in range(1, len(headers) + 1):
                 ws.cell(row=row_excel_idx, column=col_idx).fill = current_base_fill
@@ -261,7 +286,6 @@ if excel_file and pdf_files:
             if is_missing_in_pdf:
                 continue
 
-            # Run Value Discrepancy Checks (Mismatches override base colors with red)
             if idx_line:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_line), ws.cell(row=row_pdf_idx, column=idx_line)
                 if clean_line_num(cell_e.value) != clean_line_num(cell_p.value) and cell_p.value is not None:
