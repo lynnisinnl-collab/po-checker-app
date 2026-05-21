@@ -204,7 +204,7 @@ if excel_file and pdf_files:
             ex_line = clean_line_num(row.get('Line'))
             
             excel_side_row = {col: row[col] for col in df_excel.columns}
-            excel_side_row['Data Block Source'] = 'Excel A (System Master Data)'
+            excel_side_row['Data Block Source'] = 'GloviaG2'
             
             if 'Required Date/Time' in excel_side_row:
                 excel_side_row['Required Date/Time'] = parse_date_to_custom_format(excel_side_row['Required Date/Time'])
@@ -242,7 +242,7 @@ if excel_file and pdf_files:
                         match = candidates[0][1]
 
             pdf_side_row = {col: None for col in df_excel.columns}
-            pdf_side_row['Data Block Source'] = 'PDF Extracted (PO Check Zone)'
+            pdf_side_row['Data Block Source'] = 'PDF'
             pdf_side_row[item_col_name] = excel_item
             
             confirmation_note_text = ""
