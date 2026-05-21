@@ -276,7 +276,7 @@ if excel_file and pdf_files:
                         else:
                             delivery_ddmmyy = digits[:6]
                         
-                    confirmation_note_text = f"{today_str} LL confirmed delivery date {delivery_ddmmyy}"
+                    confirmation_note_text = f"{today_str} lla dd conf. {delivery_ddmmyy}"
             else:
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = "Not found in PO PDF"
             
