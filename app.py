@@ -18,7 +18,7 @@ st.title("📦 Purchase Order Checking Assistant")
 st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report with matching confirmation notes.")
 
 # Securely fetch API key
-GOOGLE_API_KEY = "AIzaSyCLRPvaRRZSmkNjsB-h1rBh5sbpqkICBbw"
+GOOGLE_API_KEY = "AIzaSyCpI3_r8CgJ80y2puraULsBEo-2vpACtH8"
 
 if not GOOGLE_API_KEY:
     st.error("🔑 Google API Key not found! Please configure it in your environment or secrets.")
