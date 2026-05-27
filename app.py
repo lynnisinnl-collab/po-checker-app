@@ -263,20 +263,25 @@ if excel_file and pdf_files:
                 ex_date = parse_date_to_custom_format(row.get('Required Date/Time'))
                 pdf_date = parse_date_to_custom_format(match.get('Required_Date'))
                 
-                if (ex_line == pdf_line and ex_qty == pdf_qty and ex_price == pdf_price and ex_date == pdf_date and ex_date != ""):
+                # --- [修改部分開始] ---
+                # 不論各欄位是否完全吻合，只要在 PDF 裡有找到這個 item 並且有 pdf_date，就直接產生 confirmation note
+                if pdf_date and pdf_date != "":
                     today_str = datetime.now().strftime("%d%m")
                     
-                    if '/' in ex_date:
-                        date_parts = ex_date.split('/')
+                    # 強制使用 pdf_date 來組合 delivery_ddmmyy
+                    if '/' in pdf_date:
+                        date_parts = pdf_date.split('/')
                         delivery_ddmmyy = date_parts[0] + date_parts[1] + date_parts[2][-2:]
                     else:
-                        digits = "".join([c for c in ex_date if c.isdigit()])
+                        digits = "".join([c for c in pdf_date if c.isdigit()])
                         if len(digits) >= 8:
                             delivery_ddmmyy = digits[:4] + digits[-2:]
                         else:
                             delivery_ddmmyy = digits[:6]
                         
                     confirmation_note_text = f"{today_str} lla dd conf. {delivery_ddmmyy}"
+                # --- [修改部分結束] ---
+
             else:
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = "Not found in PO PDF"
             
@@ -347,11 +352,8 @@ if excel_file and pdf_files:
                     
             if idx_date:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_date), ws.cell(row=row_pdf_idx, column=idx_date)
-                # 修改此處：如果日期不同且 PDF 有抓到日期，除了標紅之外，直接將 Excel 端的 Notes 改成 PDF 日期
                 if cell_e.value != cell_p.value and cell_p.value is not None and cell_p.value != "":
                     cell_e.fill = fill_red; cell_p.fill = fill_red
-                    if idx_notes:
-                        ws.cell(row=row_excel_idx, column=idx_notes).value = str(cell_p.value)
 
         excel_buffer = io.BytesIO()
         wb.save(excel_buffer)
