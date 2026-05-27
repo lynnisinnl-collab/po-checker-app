@@ -264,17 +264,29 @@ if excel_file and pdf_files:
                 ex_date = parse_date_to_custom_format(row.get('Required Date/Time'))
                 pdf_date = parse_date_to_custom_format(match.get('Required_Date'))
                 
-                # --- [修改部分開始] ---
-                # 不論各欄位是否完全吻合，只要在 PDF 裡有找到這個 item 並且有 pdf_date，就直接產生 confirmation note
-                if pdf_date and pdf_date != "":
+                # --- [修改部分：安全防呆加強版] ---
+                if pdf_date and str(pdf_date).strip() != "":
                     today_str = datetime.now().strftime("%d%m")
+                    delivery_ddmmyy = ""
+                    pdf_date_str = str(pdf_date).strip()
                     
-                    # 強制使用 pdf_date 來組合 delivery_ddmmyy
-                    if '/' in pdf_date:
-                        date_parts = pdf_date.split('/')
-                        delivery_ddmmyy = date_parts[0] + date_parts[1] + date_parts[2][-2:]
+                    if '/' in pdf_date_str:
+                        date_parts = pdf_date_str.split('/')
+                        if len(date_parts) >= 3:
+                            # 標準 DD/MM/YYYY 狀況
+                            delivery_ddmmyy = date_parts[0] + date_parts[1] + date_parts[2][-2:]
+                        else:
+                            # 異常狀況：有斜線但長度不足，提取純數字處理
+                            digits = "".join([c for c in pdf_date_str if c.isdigit()])
+                            if len(digits) >= 8:
+                                delivery_ddmmyy = digits[:4] + digits[-2:]
+                            elif len(digits) >= 6:
+                                delivery_ddmmyy = digits[:6]
+                            else:
+                                delivery_ddmmyy = digits
                     else:
-                        digits = "".join([c for c in pdf_date if c.isdigit()])
+                        # 無斜線狀況，提取純數字處理
+                        digits = "".join([c for c in pdf_date_str if c.isdigit()])
                         if len(digits) >= 8:
                             delivery_ddmmyy = digits[:4] + digits[-2:]
                         else:
