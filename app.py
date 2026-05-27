@@ -18,10 +18,11 @@ st.title("📦 Purchase Order Checking Assistant")
 st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report with matching confirmation notes.")
 
 # Securely fetch API key
-GOOGLE_API_KEY = "AIzaSyCiCyqx4dN4qsr0LkqotyA15P6OtVEXmH8"
-
-if not GOOGLE_API_KEY:
-    st.error("🔑 Google API Key not found! Please configure it in your environment or secrets.")
+# 修改後的安全寫法（✅ 從 Secrets 讀取）
+if "GOOGLE_API_KEY" in st.secrets:
+    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+else:
+    st.error("🔑 Google API Key 尚未設定！請在 Streamlit 的 Secrets 中進行配置。")
     st.stop()
 
 client = genai.Client(api_key=GOOGLE_API_KEY)
