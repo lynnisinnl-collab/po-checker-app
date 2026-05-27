@@ -347,8 +347,11 @@ if excel_file and pdf_files:
                     
             if idx_date:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_date), ws.cell(row=row_pdf_idx, column=idx_date)
+                # 修改此處：如果日期不同且 PDF 有抓到日期，除了標紅之外，直接將 Excel 端的 Notes 改成 PDF 日期
                 if cell_e.value != cell_p.value and cell_p.value is not None and cell_p.value != "":
                     cell_e.fill = fill_red; cell_p.fill = fill_red
+                    if idx_notes:
+                        ws.cell(row=row_excel_idx, column=idx_notes).value = str(cell_p.value)
 
         excel_buffer = io.BytesIO()
         wb.save(excel_buffer)
