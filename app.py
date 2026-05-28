@@ -2,6 +2,7 @@ import os
 import json
 import io
 import time  
+import re
 from datetime import datetime
 import pandas as pd
 from google import genai  
@@ -41,62 +42,76 @@ def clean_line_num(val):
     if pd.isna(val) or val is None: return ""
     return str(val).strip().split('-')[0].strip().lstrip('0')
 
-# Standard numeric normalizer for quantities
-def normalize_numeric(v):
-    if pd.isna(v) or v is None: return None
-    try:
-        s = str(v).replace(' ', '').replace('€', '').replace('st.', '').strip()
-        if not s: return None
-        if ',' in s and '.' in s: s = s.replace(',', '')
-        elif ',' in s and '.' not in s: s = s.replace(',', '.')
-        return round(float(s), 2)
-    except:
-        return None
+# NEW: Highly robust parsing tool to strip extra zeros (,0000) and isolate units (ST, pack, EA)
+def parse_qty_and_unit(v):
+    if pd.isna(v) or v is None:
+        return None, None
+    s = str(v).strip()
+    
+    # Match the leading numbers/decimals and capture trailing text units
+    match = re.match(r'^([\d\s.,]+)(.*)$', s)
+    if match:
+        num_part = match.group(1).strip()
+        unit_part = match.group(2).strip()
+        
+        # Handle specific system decimal formatting like "500,0000" or "500.0000"
+        if ',' in num_part and '.' not in num_part:
+            parts = num_part.split(',')
+            if len(parts) == 2 and parts[1] == '0000':
+                num_part = parts[0]
+            else:
+                num_part = num_part.replace(',', '.')
+        elif '.' in num_part and ',' not in num_part:
+            parts = num_part.split('.')
+            if len(parts) == 2 and parts[1] == '0000':
+                num_part = parts[0]
+                
+        num_part = num_part.replace(' ', '')
+        
+        try:
+            val = float(num_part)
+            if val.is_integer():
+                val = int(val)
+            return val, unit_part if unit_part else None
+        except:
+            return None, None
+    return None, None
 
-# NEW: Smart Price Normalizer to handle currency formatting and bulk rates (e.g., "per 100 st 5,34" vs "0,0534")
+# Smart Price Normalizer to handle currency formatting and bulk rates (e.g., "per 100 st 5,34" vs "0,0534")
 def normalize_price(v):
     if pd.isna(v) or v is None: return None
     s = str(v).lower().strip()
     
-    # Detect if the price is a bulk rate (per 100 or per 1000)
     factor = 1.0
     if "per 100" in s or "/100" in s or "per100" in s:
         factor = 100.0
     elif "per 1000" in s or "/1000" in s or "per1000" in s:
         factor = 1000.0
         
-    # Strip common suffixes and unit strings
     for text_to_remove in ['st.', 'st', '€', 'eur', 'per 1000', 'per 100', 'per1000', 'per100', 'ex works', 'piece', 'pcs']:
         s = s.replace(text_to_remove, '')
     s = s.strip()
     
     if not s: return None
-    
-    # Standardize leading commas (e.g., ",0534" -> "0,0534")
-    if s.startswith(','):
-        s = '0' + s
+    if s.startswith(','): s = '0' + s
         
-    # Handle European vs US decimal separators
     if ',' in s and '.' in s:
-        if s.rfind(',') > s.rfind('.'):
-            s = s.replace('.', '').replace(',', '.')
-        else:
-            s = s.replace(',', '')
+        if s.rfind(',') > s.rfind('.'): s = s.replace('.', '').replace(',', '.')
+        else: s = s.replace(',', '')
     elif ',' in s and '.' not in s:
         s = s.replace(',', '.')
         
     try:
         unit_val = float(s)
-        # Calculate single unit price and round to 4 decimal points for high precision
         return round(unit_val / factor, 4)
     except:
         return None
 
-# ENHANCED: Smart date parser supporting both dot (.) and slash (/) formats (e.g., 09.07.2026 -> 09/07/2026)
+# Smart date parser supporting both dot (.) and slash (/) formats (e.g., 09.07.2026 -> 09/07/2026)
 def parse_date_to_custom_format(v):
     if pd.isna(v) or v is None: return ""
     s = str(v).replace(':', '').replace('Delivery Date', '').strip()
-    s = s.replace('.', '/')  # Seamlessly converts 09.07.2026 into 09/07/2026
+    s = s.replace('.', '/')  
     s = s.split(',')[0].strip().split()[0]
     for fmt in ('%d/%m/%Y', '%Y/%m/%d', '%m/%d/%Y', '%d-%m-%Y', '%Y-%m-%d'):
         try: 
@@ -141,7 +156,7 @@ if excel_file and pdf_files:
                 "Line": types.Schema(type=types.Type.STRING, description="The sequence position or row index number, e.g. '1', '2', '3', '7', '8'"),
                 "Item": types.Schema(type=types.Type.STRING, description="The drawing number or item string like '1237190 Rev: 01'"),
                 "Description": types.Schema(type=types.Type.STRING, description="Product item text name description"),
-                "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity numerical value count"),
+                "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity numerical value count optionally with unit like '500 ST' or '100 pack'"),
                 "Unit_Price": types.Schema(type=types.Type.STRING, description="Price text including conditions, e.g., 'per 100 st 5,34' or '0,0534'"),
                 "Required_Date": types.Schema(type=types.Type.STRING, description="Delivery Date string value")
             },
@@ -187,7 +202,6 @@ if excel_file and pdf_files:
                     end_page = min(start_page + pages_per_chunk, total_pages)
                     st.write(f"   📄 Parsing pages {start_page + 1} to {end_page} (Total: {total_pages} pages)...")
                     
-                    # Create temporary page chunk PDF
                     pdf_writer = pypdf.PdfWriter()
                     for p_idx in range(start_page, end_page):
                         pdf_writer.add_page(pdf_reader.pages[p_idx])
@@ -218,17 +232,12 @@ if excel_file and pdf_files:
                             break  
                         except Exception as api_err:
                             err_msg = str(api_err)
-                            
-                            # Handle Hard Daily Limit Cap Exceeded
                             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                                st.error("🛑 **Daily Quota Limit Reached (429)!** Your Gemini account configuration limit has been met.")
+                                st.error("🛑 **Daily Quota Limit Reached (429)!**")
                                 quota_exhausted = True
                                 break
-                            
-                            # Handle Server Busy
                             if "503" in err_msg or "UNAVAILABLE" in err_msg:
                                 if attempt < max_retries - 1:
-                                    st.warning(f"⏳ Server overloaded (503). Retrying chunk in {retry_delay}s... (Attempt {attempt + 1}/{max_retries})")
                                     time.sleep(retry_delay)
                                     retry_delay *= 2  
                                     continue
@@ -237,7 +246,6 @@ if excel_file and pdf_files:
                     if quota_exhausted:
                         st.stop()
                         
-                    # Parse returned chunked output
                     if response and response.text:
                         try:
                             items_data = json.loads(response.text.strip())
@@ -272,6 +280,12 @@ if excel_file and pdf_files:
             excel_side_row = {col: row[col] for col in df_excel.columns}
             excel_side_row['Data Block Source'] = 'GloviaG2'
             
+            # Formats/cleans the Excel Quantity row display immediately (removes ,0000)
+            if 'Order Quantity' in excel_side_row:
+                ex_qty_num, _ = parse_qty_and_unit(excel_side_row['Order Quantity'])
+                if ex_qty_num is not None:
+                    excel_side_row['Order Quantity'] = str(ex_qty_num)
+            
             if 'Required Date/Time' in excel_side_row:
                 excel_side_row['Required Date/Time'] = parse_date_to_custom_format(excel_side_row['Required Date/Time'])
             
@@ -283,18 +297,15 @@ if excel_file and pdf_files:
                     po_key = clean_key(po_item)
                     po_desc_key = clean_key(po_row.get('Description', ''))
                     
-                    # Match on Part Numbers / Item Code / Description match
                     if (po_key and (po_key in excel_key or excel_key in po_key)) or (excel_key and excel_key in po_desc_key):
                         candidates.append((po_idx, po_row))
                 
                 if candidates:
-                    # SMART PAIRING: First see if there's a matching line convention
                     for po_idx, po_row in candidates:
                         if clean_line_num(po_row.get('Line')) == ex_line and po_idx not in used_po_indices:
                             match = po_row
                             used_po_indices.add(po_idx)
                             break
-                    # LENIENT FALLBACK: If Line number convention differs (e.g. 0001 vs 10) but item is identical, bind them together!
                     if match is None:
                         for po_idx, po_row in candidates:
                             if po_idx not in used_po_indices:
@@ -314,32 +325,39 @@ if excel_file and pdf_files:
                 if 'Line' in df_excel.columns: pdf_side_row['Line'] = match.get('Line')
                 if 'Unit Price' in df_excel.columns: pdf_side_row['Unit Price'] = match.get('Unit_Price')
                 if 'Required Date/Time' in df_excel.columns: pdf_side_row['Required Date/Time'] = parse_date_to_custom_format(match.get('Required_Date'))
-                if 'Order Quantity' in df_excel.columns: pdf_side_row['Order Quantity'] = match.get('Order_Quantity')
+                
+                # Dynamic Extraction: Splits numeric part from unit (e.g. "500 ST" -> "500" & "ST")
+                raw_pdf_qty = match.get('Order_Quantity')
+                cleaned_pdf_qty, extracted_unit = parse_qty_and_unit(raw_pdf_qty)
+                
+                if 'Order Quantity' in df_excel.columns: 
+                    pdf_side_row['Order Quantity'] = str(cleaned_pdf_qty) if cleaned_pdf_qty is not None else raw_pdf_qty
+                
+                # Smart UM Alignment: Push extracted units automatically into available measure columns
+                for um_col in ['UM', 'Stock UM', 'In Stock UM']:
+                    if um_col in df_excel.columns:
+                        pdf_side_row[um_col] = extracted_unit if extracted_unit else excel_side_row.get(um_col)
+                        
                 pdf_side_row[unnamed_col] = match.get('Description', 'No Description')
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = f"Extracted from PDF: {match.get('PO_Source_File', '')}"
                 
                 pdf_date = parse_date_to_custom_format(match.get('Required_Date'))
                 
-                # Automated Auto-Confirmation string tracking
                 if pdf_date and str(pdf_date).strip() != "":
                     today_str = datetime.now().strftime("%d%m")
                     delivery_ddmmyy = ""
                     pdf_date_str = str(pdf_date).strip()
-                    
                     if '/' in pdf_date_str:
                         date_parts = pdf_date_str.split('/')
                         if len(date_parts) >= 3:
                             delivery_ddmmyy = date_parts[0] + date_parts[1] + date_parts[2][-2:]
-                    else:
-                        digits = "".join([c for c in pdf_date_str if c.isdigit()])
-                        if len(digits) >= 6:
-                            delivery_ddmmyy = digits[:4] + digits[-2:]
-                        else:
-                            delivery_ddmmyy = digits
-                        
                     confirmation_note_text = f"{today_str} lla dd conf. {delivery_ddmmyy}"
             else:
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = "Not found in PO PDF"
+                # Keep unit intact from Excel if PDF item was missing completely
+                for um_col in ['UM', 'Stock UM', 'In Stock UM']:
+                    if um_col in df_excel.columns:
+                        pdf_side_row[um_col] = excel_side_row.get(um_col)
             
             excel_side_row['Confirmation Note'] = confirmation_note_text
             pdf_side_row['Confirmation Note'] = confirmation_note_text
@@ -353,7 +371,6 @@ if excel_file and pdf_files:
             structured_rows.append(blank_spacer_row)
 
         df_final = pd.DataFrame(structured_rows)
-        
         core_cols = [c for c in df_final.columns if c not in ['Data Block Source', 'Confirmation Note']]
         cols = ['Data Block Source'] + core_cols + ['Confirmation Note']
         df_final = df_final[cols]
@@ -390,19 +407,21 @@ if excel_file and pdf_files:
             if is_missing_in_pdf:
                 continue
 
-            # Quantities Check
+            # Quantities Check (Using advanced parser to ignore ,0000 and unit formatting differences)
             if idx_qty:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_qty), ws.cell(row=row_pdf_idx, column=idx_qty)
-                if normalize_numeric(cell_e.value) != normalize_numeric(cell_p.value) and cell_p.value is not None:
+                val_e, _ = parse_qty_and_unit(cell_e.value)
+                val_p, _ = parse_qty_and_unit(cell_p.value)
+                if val_e != val_p and cell_p.value is not None:
                     cell_e.fill = fill_red; cell_p.fill = fill_red
 
-            # SMART RECONCILIATION: Check Unit Price using the upgraded conversion helper
+            # Unit Price Check 
             if idx_price:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_price), ws.cell(row=row_pdf_idx, column=idx_price)
                 if normalize_price(cell_e.value) != normalize_price(cell_p.value) and cell_p.value is not None:
                     cell_e.fill = fill_red; cell_p.fill = fill_red
                     
-            # Dates Check (Now supports both dots and slashes seamlessly)
+            # Dates Check
             if idx_date:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_date), ws.cell(row=row_pdf_idx, column=idx_date)
                 if cell_e.value != cell_p.value and cell_p.value is not None and cell_p.value != "":
