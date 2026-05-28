@@ -75,7 +75,7 @@ def parse_qty_and_unit(v):
             return None, None
     return None, None
 
-# NEW & UPGRADED: Dynamic Price Normalizer handling 'à', 'per X', '€', and multlingual variations
+# Dynamic Price Normalizer handling 'à', 'per X', '€', and multlingual variations
 def normalize_price(v):
     if pd.isna(v) or v is None: return None
     s = str(v).lower().strip()
@@ -160,10 +160,11 @@ if excel_file and pdf_files:
             type=types.Type.OBJECT,
             properties={
                 "Line": types.Schema(type=types.Type.STRING, description="Sequence position or row index number"),
-                "Item": types.Schema(type=types.Type.STRING, description="Drawing number or item part code"),
+                "Item": types.Schema(type=types.Type.STRING, description="The primary item number listed under standard column (e.g. 500285)"),
+                "Customer_Item": types.Schema(type=types.Type.STRING, description="The buyer's part number often found in notes or labeled as 'Uw teknr', 'Your part no', or drawing codes (e.g. 4022 262 22021)"),
                 "Description": types.Schema(type=types.Type.STRING, description="Product item text name description"),
                 "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity optionally with unit (e.g., '30 st')"),
-                "Unit_Price": types.Schema(type=types.Type.STRING, description="Price text including conditions (e.g., '€ 916,16 per 1 st' or '0,0534')"),
+                "Unit_Price": types.Schema(type=types.Type.STRING, description="Price text including conditions (e.g., '€ 916,16 per 1 st')"),
                 "Required_Date": types.Schema(type=types.Type.STRING, description="Delivery Date string value")
             },
             required=["Item", "Order_Quantity", "Unit_Price"]
@@ -174,22 +175,26 @@ if excel_file and pdf_files:
             items=po_item_schema
         )
 
-        # HIGHLY UPGRADED MULTI-LINGUAL PROMPT
+        # ULTIMATE AGGREGATED EXTRACTION PROMPT
         prompt = """
         You are an elite Purchase Order parsing specialist handling complex, multi-lingual, and aggregated PDF layouts.
         
         CRITICAL EXTRACTION RULES:
         1. MULTI-LINGUAL HEADERS AWARENESS: 
-           - Look for 'Verzendschema', 'Leverdatum', 'Liefertermin' -> This is the 'Delivery Date' (`Required_Date`).
+           - Look for 'Verzendschema', 'Leverdatum', 'Liefertermin', 'Shipping date' -> This is the 'Delivery Date' (`Required_Date`).
            - Look for 'Aantal', 'Menge', 'Quantity' -> This section contains QTY and Price.
            - Look for 'Omschrijving', 'Bezeichnung', 'Description' -> This is the Item Name/Description.
-        2. SMART SPLITTING OF COMBINED STRINGS:
-           - If Quantity and Price are grouped in one sentence (e.g., "30 st à € 916,16 per 1 st" under Aantal), YOU MUST SPLIT IT:
+        2. DUAL ITEM NUMBER EXTRACTION (CRITICAL):
+           - Standard line item tables might use a supplier part number (e.g., '500285') in the main 'Artikel' column.
+           - Scan the blocks right below or around it for the Buyer's Customer Part Number, frequently labeled as 'Uw teknr:', 'Your part No:', 'Drawing No:' (e.g., '4022 262 22021'). 
+           - Put the main number in `Item` and the drawing/customer part number in `Customer_Item`. Do NOT miss this block.
+        3. SMART SPLITTING OF COMBINED STRINGS:
+           - If Quantity and Price are grouped in one block (e.g., "30 st à € 916,16 per 1 st"), YOU MUST SPLIT IT:
              `Order_Quantity` = "30 st"
              `Unit_Price` = "€ 916,16 per 1 st"
-        3. RELATIVE POSITIONING:
+        4. RELATIVE POSITIONING:
            - Item Names / Descriptions (e.g., "Z-Slide") are frequently placed DIRECTLY ABOVE or BELOW the actual part number. Read the surrounding vertical space carefully to capture the correct Description.
-        4. COMPLETENESS:
+        5. COMPLETENESS:
            - Unpack everything completely so every individual item code gets its own JSON object. Ensure no dates, quantities, prices, or descriptions are missed due to language or vertical spacing.
         """
 
@@ -306,10 +311,17 @@ if excel_file and pdf_files:
                 candidates = []
                 for po_idx, po_row in df_po.iterrows():
                     po_item = str(po_row.get('Item', '')).strip()
-                    po_key = clean_key(po_item)
-                    po_desc_key = clean_key(po_row.get('Description', ''))
+                    po_cust_item = str(po_row.get('Customer_Item', '')).strip()
+                    po_desc = str(po_row.get('Description', '')).strip()
                     
-                    if (po_key and (po_key in excel_key or excel_key in po_key)) or (excel_key and excel_key in po_desc_key):
+                    po_key_primary = clean_key(po_item)
+                    po_key_customer = clean_key(po_cust_item)
+                    po_key_desc = clean_key(po_desc)
+                    
+                    # Enhanced 3D matching logic: Check primary item number, secondary customer number, or descriptions
+                    if ((po_key_primary and (po_key_primary in excel_key or excel_key in po_key_primary)) or 
+                        (po_key_customer and (po_key_customer in excel_key or excel_key in po_key_customer)) or 
+                        (excel_key and excel_key in po_key_desc)):
                         candidates.append((po_idx, po_row))
                 
                 if candidates:
