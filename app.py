@@ -15,7 +15,7 @@ import pypdf  # Requirement: pip install pypdf
 # ==========================================
 # APP CONFIGURATION & UI SETUP (ALL ENGLISH)
 # ==========================================
-st.set_page_config(page_title="PO Checker AI", layout="centered")
+st.set_page_config(page_title="PO Checker AI", layout="wide")
 st.title("📦 Purchase Order Checking Assistant")
 st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report with matching confirmation notes.")
 
@@ -75,18 +75,21 @@ def parse_qty_and_unit(v):
             return None, None
     return None, None
 
-# NEW & UPGRADED: Dynamic Price Normalizer to handle any "per X" bulk rates (e.g., "per 100St 5,34" -> 0.0534)
+# NEW & UPGRADED: Dynamic Price Normalizer handling 'à', 'per X', '€', and multlingual variations
 def normalize_price(v):
     if pd.isna(v) or v is None: return None
     s = str(v).lower().strip()
     
-    # 1. Dynamically extract the bulk factor using Regex (e.g., 100 from "per 100 st", "/1000", "per100st")
+    # Clean up prefixes like 'à' from European formats
+    s = s.replace('à', '')
+    
+    # 1. Dynamically extract the bulk factor using Regex
     factor = 1.0
     match_factor = re.search(r'(?:per|/)\s*(\d+)', s)
     if match_factor:
         factor = float(match_factor.group(1))
         
-    # 2. Remove the bulk pricing text entirely so only the monetary value remains
+    # 2. Remove the bulk pricing text entirely
     s = re.sub(r'(?:per|/)\s*\d+\s*[a-z]*', '', s)
     
     # 3. Clean up common currency and unit symbols
@@ -112,13 +115,14 @@ def normalize_price(v):
     except:
         return None
 
-# Smart date parser supporting both dot (.) and slash (/) formats
+# Smart date parser supporting dot (.), slash (/), and hyphen (-) formats natively
 def parse_date_to_custom_format(v):
     if pd.isna(v) or v is None: return ""
     s = str(v).replace(':', '').replace('Delivery Date', '').strip()
-    s = s.replace('.', '/')  
+    s = s.replace('.', '/').replace('-', '/')  
     s = s.split(',')[0].strip().split()[0]
-    for fmt in ('%d/%m/%Y', '%Y/%m/%d', '%m/%d/%Y', '%d-%m-%Y', '%Y-%m-%d'):
+    
+    for fmt in ('%d/%m/%Y', '%Y/%m/%d', '%m/%d/%Y'):
         try: 
             return pd.to_datetime(s, format=fmt).strftime('%d/%m/%Y')
         except: 
@@ -126,7 +130,7 @@ def parse_date_to_custom_format(v):
     return str(v).strip()
 
 # ==========================================
-# UI FILE UPLOADERS (ALL ENGLISH)
+# UI FILE UPLOADERS
 # ==========================================
 excel_file = st.file_uploader("👉 Step 1: Upload System Master Data (Excel or CSV)", type=["xlsx", "xls", "csv"], key="master_data_excel_csv")
 pdf_files = st.file_uploader("👉 Step 2: Upload PO PDF file(s)", type=["pdf"], accept_multiple_files=True, key="po_pdf_files_list")
@@ -137,7 +141,6 @@ pdf_files = st.file_uploader("👉 Step 2: Upload PO PDF file(s)", type=["pdf"],
 if excel_file and pdf_files:
     if st.button("🚀 Run AI Verification Report"):
         
-        # Read Master Data
         if excel_file.name.lower().endswith('.csv'):
             df_excel = pd.read_csv(excel_file, dtype=str)
         else:
@@ -145,7 +148,6 @@ if excel_file and pdf_files:
             
         df_excel.columns = df_excel.columns.astype(str).str.strip()
 
-        # Discover the Primary Item Identification column in Master Data
         item_col_name = next((c for c in df_excel.columns if c.lower() in ['item', 'item number', 'material', 'part no', 'part number']), 'Item')
         if item_col_name not in df_excel.columns and len(df_excel.columns) > 0:
             item_col_name = df_excel.columns[0]
@@ -154,15 +156,14 @@ if excel_file and pdf_files:
         if unnamed_col not in df_excel.columns:
             df_excel[unnamed_col] = None
 
-        # Define structured extraction schema layout
         po_item_schema = types.Schema(
             type=types.Type.OBJECT,
             properties={
-                "Line": types.Schema(type=types.Type.STRING, description="The sequence position or row index number, e.g. '1', '2', '3', '7', '8'"),
-                "Item": types.Schema(type=types.Type.STRING, description="The drawing number or item string like '1237190 Rev: 01'"),
+                "Line": types.Schema(type=types.Type.STRING, description="Sequence position or row index number"),
+                "Item": types.Schema(type=types.Type.STRING, description="Drawing number or item part code"),
                 "Description": types.Schema(type=types.Type.STRING, description="Product item text name description"),
-                "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity numerical value count optionally with unit like '500 ST' or '100 pack'"),
-                "Unit_Price": types.Schema(type=types.Type.STRING, description="Price text exactly as shown including bulk condition, e.g., 'per 100 st 5,34' or '0,0534'"),
+                "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity optionally with unit (e.g., '30 st')"),
+                "Unit_Price": types.Schema(type=types.Type.STRING, description="Price text including conditions (e.g., '€ 916,16 per 1 st' or '0,0534')"),
                 "Required_Date": types.Schema(type=types.Type.STRING, description="Delivery Date string value")
             },
             required=["Item", "Order_Quantity", "Unit_Price"]
@@ -173,16 +174,23 @@ if excel_file and pdf_files:
             items=po_item_schema
         )
 
-        # Advanced prompting for multi-page document layout parsing
+        # HIGHLY UPGRADED MULTI-LINGUAL PROMPT
         prompt = """
-        You are a meticulous purchase order parsing specialist working with multi-line aggregated layouts.
-        This PDF documents text-tracks by grouping multiple records vertically in single rows.
+        You are an elite Purchase Order parsing specialist handling complex, multi-lingual, and aggregated PDF layouts.
         
         CRITICAL EXTRACTION RULES:
-        1. Look closely at grouped lines (e.g., lines 3, 4, 5 or lines 8, 10). The item codes, line numbers, quantities, and prices may be listed sequentially separated by newlines in single column blocks, OR temporarily merged due to layout distortion (e.g., QTY and Price squeezed together like '5 EA\\n 582,16'). 
-           YOU MUST UNPACK THEM completely and correctly split them up so that every individual item code gets its own separate JSON object in the output list.
-        2. Clean and capture the specific 'Order Quantity', 'Unit Price' (preserve full text mapping context like 'per 100 st 5,34' or '/1000 50,00'), and 'Delivery Date' fields associated with that item sequence rank position.
-        3. Extract the item part numbers wherever they sit (checking both the column headers and descriptions text blocks).
+        1. MULTI-LINGUAL HEADERS AWARENESS: 
+           - Look for 'Verzendschema', 'Leverdatum', 'Liefertermin' -> This is the 'Delivery Date' (`Required_Date`).
+           - Look for 'Aantal', 'Menge', 'Quantity' -> This section contains QTY and Price.
+           - Look for 'Omschrijving', 'Bezeichnung', 'Description' -> This is the Item Name/Description.
+        2. SMART SPLITTING OF COMBINED STRINGS:
+           - If Quantity and Price are grouped in one sentence (e.g., "30 st à € 916,16 per 1 st" under Aantal), YOU MUST SPLIT IT:
+             `Order_Quantity` = "30 st"
+             `Unit_Price` = "€ 916,16 per 1 st"
+        3. RELATIVE POSITIONING:
+           - Item Names / Descriptions (e.g., "Z-Slide") are frequently placed DIRECTLY ABOVE or BELOW the actual part number. Read the surrounding vertical space carefully to capture the correct Description.
+        4. COMPLETENESS:
+           - Unpack everything completely so every individual item code gets its own JSON object. Ensure no dates, quantities, prices, or descriptions are missed due to language or vertical spacing.
         """
 
         all_po_items = []
@@ -195,10 +203,8 @@ if excel_file and pdf_files:
                 pdf_file.seek(0)
                 pdf_bytes = pdf_file.read()
                 
-                if len(pdf_bytes) == 0:
-                    continue
+                if len(pdf_bytes) == 0: continue
 
-                # --- Using pypdf for long file page chunking (2 pages per batch) ---
                 pdf_reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
                 total_pages = len(pdf_reader.pages)
                 pages_per_chunk = 2 
@@ -215,7 +221,6 @@ if excel_file and pdf_files:
                     pdf_writer.write(chunk_buffer)
                     chunk_bytes = chunk_buffer.getvalue()
 
-                    # --- PROTECTED API CALL WITH EMBEDDED RETRY LOGIC ---
                     max_retries = 4
                     retry_delay = 4  
                     response = None
@@ -248,8 +253,7 @@ if excel_file and pdf_files:
                                     continue
                             raise api_err  
                     
-                    if quota_exhausted:
-                        st.stop()
+                    if quota_exhausted: st.stop()
                         
                     if response and response.text:
                         try:
@@ -258,8 +262,7 @@ if excel_file and pdf_files:
                                 item['PO_Source_File'] = pdf_file.name
                                 all_po_items.append(item)
                         except json.JSONDecodeError:
-                            st.warning(f"⚠️ Failed to parse JSON for pages {start_page+1}-{end_page}, automatically skipping this chunk.")
-                    
+                            st.warning(f"⚠️ Failed to parse JSON for pages {start_page+1}-{end_page}, skipping chunk.")
                     time.sleep(2)
                         
             except Exception as e:
@@ -285,13 +288,11 @@ if excel_file and pdf_files:
             excel_side_row = {col: row[col] for col in df_excel.columns}
             excel_side_row['Data Block Source'] = 'GloviaG2'
             
-            # 1. Standardize Excel Quantity Row (Removes trailing ,0000)
             if 'Order Quantity' in excel_side_row:
                 ex_qty_num, _ = parse_qty_and_unit(excel_side_row['Order Quantity'])
                 if ex_qty_num is not None:
                     excel_side_row['Order Quantity'] = str(ex_qty_num)
             
-            # 2. Standardize Excel Unit Price Row
             if 'Unit Price' in excel_side_row:
                 ex_price_num = normalize_price(excel_side_row['Unit Price'])
                 if ex_price_num is not None:
@@ -329,28 +330,25 @@ if excel_file and pdf_files:
             pdf_side_row = {col: None for col in df_excel.columns}
             pdf_side_row['Data Block Source'] = 'PDF'
             pdf_side_row[item_col_name] = excel_item
-            
             confirmation_note_text = ""
             
             if match is not None:
                 if 'Line' in df_excel.columns: pdf_side_row['Line'] = match.get('Line')
                 
-                # 3. Smart PDF Price Conversion & Visual Output
                 raw_pdf_price = match.get('Unit_Price')
                 calc_pdf_price = normalize_price(raw_pdf_price)
                 if 'Unit Price' in df_excel.columns: 
                     pdf_side_row['Unit Price'] = str(calc_pdf_price) if calc_pdf_price is not None else raw_pdf_price
                 
-                if 'Required Date/Time' in df_excel.columns: pdf_side_row['Required Date/Time'] = parse_date_to_custom_format(match.get('Required_Date'))
+                if 'Required Date/Time' in df_excel.columns: 
+                    pdf_side_row['Required Date/Time'] = parse_date_to_custom_format(match.get('Required_Date'))
                 
-                # Dynamic Quantity Extraction
                 raw_pdf_qty = match.get('Order_Quantity')
                 cleaned_pdf_qty, extracted_unit = parse_qty_and_unit(raw_pdf_qty)
                 
                 if 'Order Quantity' in df_excel.columns: 
                     pdf_side_row['Order Quantity'] = str(cleaned_pdf_qty) if cleaned_pdf_qty is not None else raw_pdf_qty
                 
-                # Smart UM Alignment: Push extracted units automatically into available measure columns
                 for um_col in ['UM', 'Stock UM', 'In Stock UM']:
                     if um_col in df_excel.columns:
                         pdf_side_row[um_col] = extracted_unit if extracted_unit else excel_side_row.get(um_col)
@@ -359,7 +357,6 @@ if excel_file and pdf_files:
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = f"Extracted from PDF: {match.get('PO_Source_File', '')}"
                 
                 pdf_date = parse_date_to_custom_format(match.get('Required_Date'))
-                
                 if pdf_date and str(pdf_date).strip() != "":
                     today_str = datetime.now().strftime("%d%m")
                     delivery_ddmmyy = ""
@@ -420,10 +417,8 @@ if excel_file and pdf_files:
             for col_idx in range(1, len(headers) + 1):
                 ws.cell(row=row_excel_idx, column=col_idx).fill = current_base_fill
 
-            if is_missing_in_pdf:
-                continue
+            if is_missing_in_pdf: continue
 
-            # Quantities Check 
             if idx_qty:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_qty), ws.cell(row=row_pdf_idx, column=idx_qty)
                 val_e, _ = parse_qty_and_unit(cell_e.value)
@@ -431,13 +426,11 @@ if excel_file and pdf_files:
                 if val_e != val_p and cell_p.value is not None:
                     cell_e.fill = fill_red; cell_p.fill = fill_red
 
-            # Unit Price Check (Comparing the visual values directly)
             if idx_price:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_price), ws.cell(row=row_pdf_idx, column=idx_price)
                 if normalize_price(cell_e.value) != normalize_price(cell_p.value) and cell_p.value is not None:
                     cell_e.fill = fill_red; cell_p.fill = fill_red
                     
-            # Dates Check
             if idx_date:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_date), ws.cell(row=row_pdf_idx, column=idx_date)
                 if cell_e.value != cell_p.value and cell_p.value is not None and cell_p.value != "":
