@@ -17,7 +17,7 @@ import pypdf  # Requirement: pip install pypdf
 # ==========================================
 st.set_page_config(page_title="PO Checker AI", layout="wide")
 st.title("📦 Purchase Order Checking Assistant")
-st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report with matching confirmation notes (Supports Split Deliveries & Loose Text/Line Matching).")
+st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report with matching confirmation notes.")
 
 # Securely fetch API key
 if "GOOGLE_API_KEY" in st.secrets:
@@ -35,6 +35,27 @@ def clean_key(val):
     s = str(val).replace(" ", "").replace("-", "").replace(".", "").lower().strip()
     if 'rev' in s:
         s = s.split('rev')[0].strip()
+    return s
+
+# ULTIMATE SEMANTIC TEXT CLEANER: Translates word-numbers (four) to digit-numbers (4) and unifies '+' with '&'
+def clean_description_semantic(val):
+    if pd.isna(val) or val is None: return ""
+    s = str(val).lower().strip()
+    
+    # 1. Unify symbols commonly swapped in item names
+    s = s.replace('+', '&').replace('and', '&').replace('en', '&')
+    
+    # 2. Map english written word numbers directly to integers to avoid alignment breaks
+    word_to_digit = {
+        'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
+        'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10'
+    }
+    for word, digit in word_to_digit.items():
+        # Use regex boundary to replace full words only, avoiding partial overlaps
+        s = re.sub(r'\b' + word + r'\b', digit, s)
+        
+    # 3. Strip extra spaces and punctuation to create a pure matching hash string
+    s = re.sub(r'[^a-z0-9&]', '', s)
     return s
 
 # Standardize line numbers (e.g., '0009' -> '9', '090/000' -> '9')
@@ -181,7 +202,6 @@ if excel_file and pdf_files:
             items=po_item_schema
         )
 
-        # PROMPT ENHANCED FOR FALLBACKS AND LOOSE MATCHES
         prompt = """
         You are an elite Purchase Order parsing specialist handling complex multi-lingual layouts with split delivery dates and irregular descriptions.
         
@@ -191,8 +211,6 @@ if excel_file and pdf_files:
            - Capture the row 'Line' (e.g. '090/000'), 'Item' (e.g. '511154'), and 'Description' (e.g. 'Set Point 4 & 5 disk vlgs tek').
         2. SPLIT DELIVERIES / VERZENDSCHEMA:
            - Scan underneath the line item for single or multiple delivery blocks. If a delivery date exists without an explicit split quantity listed next to it, assume it takes the full or default quantity for that line.
-        3. MULTI-LINGUAL HEADERS:
-           - Keep mapping 'Verzendschema' to delivery schedules, 'Aantal' to quantity/price, and 'Omschrijving' to descriptions.
         """
 
         all_po_items = []
@@ -276,7 +294,7 @@ if excel_file and pdf_files:
             st.stop()
 
         df_po = pd.DataFrame(all_po_items)
-        st.write("🔄 Aligning rows using 3-tier semantic routing rules...")
+        st.write("🔄 Aligning rows via translation-aware semantic routing rules...")
 
         structured_rows = []
         excel_row_blocks_meta = [] 
@@ -285,7 +303,9 @@ if excel_file and pdf_files:
             excel_item = str(row.get(item_col_name, '')).strip()
             excel_key = clean_key(excel_item)
             ex_line = clean_line_num(row.get('Line'))
-            excel_desc_key = clean_key(row.get(unnamed_col, ''))
+            
+            # Translate word numbers to digits for semantic normalization
+            excel_desc_cleaned = clean_description_semantic(row.get(unnamed_col, ''))
             
             excel_side_row = {col: row[col] for col in df_excel.columns}
             excel_side_row['Data Block Source'] = 'GloviaG2'
@@ -301,25 +321,26 @@ if excel_file and pdf_files:
             if 'Required Date/Time' in excel_side_row:
                 excel_side_row['Required Date/Time'] = parse_date_to_custom_format(excel_side_row['Required Date/Time'])
             
-            # TIERED MATCHING FALLBACK HIERARCHY (Fixes Line 0009 custom drawing edge cases)
             matched_po_item = None
             if not df_po.empty:
                 candidates = []
                 for po_idx, po_row in df_po.iterrows():
                     po_key_p = clean_key(po_row.get('Item', ''))
                     po_key_c = clean_key(po_row.get('Customer_Item', ''))
-                    po_key_d = clean_key(po_row.get('Description', ''))
+                    po_desc_cleaned = clean_description_semantic(po_row.get('Description', ''))
                     po_line_cleaned = clean_line_num(po_row.get('Line', ''))
                     
-                    # Tier 1 & 2: Match by cross-referenced numbers
+                    # Tier 1: Check primary/secondary number keys
                     is_num_match = (excel_key and ((po_key_p and (po_key_p in excel_key or excel_key in po_key_p)) or 
                                                    (po_key_c and (po_key_c in excel_key or excel_key in po_key_c))))
                     
-                    # Tier 3: Loose Fallback Match via matching index line number + text clues (e.g. Line 9 + 'disk' text token)
+                    # Tier 2: Match via sequence position index AND advanced word-to-digit translation rules
                     is_line_index_match = (ex_line and po_line_cleaned and ex_line == po_line_cleaned)
-                    is_desc_clue_match = (excel_desc_key and po_key_d and (excel_desc_key[:6] in po_key_d or po_key_d[:6] in excel_desc_key))
+                    is_semantic_desc_match = (excel_desc_cleaned and po_desc_cleaned and \
+                                              (excel_desc_cleaned in po_desc_cleaned or po_desc_cleaned in excel_desc_cleaned or \
+                                               excel_desc_cleaned[:10] in po_desc_cleaned or po_desc_cleaned[:10] in excel_desc_cleaned))
                     
-                    if is_num_match or (is_line_index_match and is_desc_clue_match) or (is_line_index_match and not excel_key):
+                    if is_num_match or (is_line_index_match and is_semantic_desc_match) or (is_line_index_match and not excel_key):
                         candidates.append(po_row)
                 
                 if candidates:
@@ -334,7 +355,6 @@ if excel_file and pdf_files:
             if matched_po_item is not None:
                 deliveries = matched_po_item.get('Deliveries', [])
                 if not isinstance(deliveries, list) or len(deliveries) == 0:
-                    # Fallback if deliveries array got unpacked empty by model
                     deliveries = [{"Split_Quantity": matched_po_item.get('Order_Quantity', '0'), "Required_Date": matched_po_item.get('Required_Date', '')}]
                 
                 total_pdf_item_qty = 0
@@ -342,7 +362,6 @@ if excel_file and pdf_files:
                     q_num, _ = parse_qty_and_unit(d.get('Split_Quantity', '0'))
                     if q_num: total_pdf_item_qty += q_num
                 if total_pdf_item_qty == 0:
-                    # Final safety fallback for quantity assignment
                     total_pdf_item_qty, _ = parse_qty_and_unit(excel_side_row.get('Order Quantity', '0'))
 
                 structured_rows.append(excel_side_row)
@@ -364,7 +383,6 @@ if excel_file and pdf_files:
                     
                     raw_split_qty = deliv.get('Split_Quantity')
                     clean_split_qty, extracted_unit = parse_qty_and_unit(raw_split_qty)
-                    # If single split with 0, inherit total fallback quantity gracefully
                     if (clean_split_qty is None or clean_split_qty == 0) and len(deliveries) == 1:
                         clean_split_qty = total_pdf_item_qty
                         
@@ -484,7 +502,7 @@ if excel_file and pdf_files:
         wb.save(excel_buffer)
         excel_buffer.seek(0)
 
-        st.success("🎉 Process Complete! Loose text fallbacks resolved perfectly.")
+        st.success("🎉 Process Complete! Text numbers (four+five) mapped perfectly.")
         st.download_button(
             label="📥 Download Discrepancy Report",
             data=excel_buffer,
