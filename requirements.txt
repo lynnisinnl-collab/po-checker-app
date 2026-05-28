@@ -1,4 +1,5 @@
 streamlit
+google-genai
 pandas
 openpyxl
-google-genai
+pypdf
