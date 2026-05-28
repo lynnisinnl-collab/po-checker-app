@@ -42,19 +42,17 @@ def clean_line_num(val):
     if pd.isna(val) or val is None: return ""
     return str(val).strip().split('-')[0].strip().lstrip('0')
 
-# NEW: Highly robust parsing tool to strip extra zeros (,0000) and isolate units (ST, pack, EA)
+# Robust parsing tool to strip extra zeros (,0000) and isolate units (ST, pack, EA)
 def parse_qty_and_unit(v):
     if pd.isna(v) or v is None:
         return None, None
     s = str(v).strip()
     
-    # Match the leading numbers/decimals and capture trailing text units
     match = re.match(r'^([\d\s.,]+)(.*)$', s)
     if match:
         num_part = match.group(1).strip()
         unit_part = match.group(2).strip()
         
-        # Handle specific system decimal formatting like "500,0000" or "500.0000"
         if ',' in num_part and '.' not in num_part:
             parts = num_part.split(',')
             if len(parts) == 2 and parts[1] == '0000':
@@ -77,37 +75,44 @@ def parse_qty_and_unit(v):
             return None, None
     return None, None
 
-# Smart Price Normalizer to handle currency formatting and bulk rates (e.g., "per 100 st 5,34" vs "0,0534")
+# NEW & UPGRADED: Dynamic Price Normalizer to handle any "per X" bulk rates (e.g., "per 100St 5,34" -> 0.0534)
 def normalize_price(v):
     if pd.isna(v) or v is None: return None
     s = str(v).lower().strip()
     
+    # 1. Dynamically extract the bulk factor using Regex (e.g., 100 from "per 100 st", "/1000", "per100st")
     factor = 1.0
-    if "per 100" in s or "/100" in s or "per100" in s:
-        factor = 100.0
-    elif "per 1000" in s or "/1000" in s or "per1000" in s:
-        factor = 1000.0
+    match_factor = re.search(r'(?:per|/)\s*(\d+)', s)
+    if match_factor:
+        factor = float(match_factor.group(1))
         
-    for text_to_remove in ['st.', 'st', '€', 'eur', 'per 1000', 'per 100', 'per1000', 'per100', 'ex works', 'piece', 'pcs']:
+    # 2. Remove the bulk pricing text entirely so only the monetary value remains
+    s = re.sub(r'(?:per|/)\s*\d+\s*[a-z]*', '', s)
+    
+    # 3. Clean up common currency and unit symbols
+    for text_to_remove in ['st.', 'st', '€', 'eur', 'piece', 'pcs', 'ea', 'pack']:
         s = s.replace(text_to_remove, '')
     s = s.strip()
     
     if not s: return None
     if s.startswith(','): s = '0' + s
         
+    # 4. Standardize European/US decimal formats
+    s = s.replace(' ', '')
     if ',' in s and '.' in s:
         if s.rfind(',') > s.rfind('.'): s = s.replace('.', '').replace(',', '.')
         else: s = s.replace(',', '')
     elif ',' in s and '.' not in s:
         s = s.replace(',', '.')
         
+    # 5. Calculate final unit price and round to 4 decimal places
     try:
         unit_val = float(s)
         return round(unit_val / factor, 4)
     except:
         return None
 
-# Smart date parser supporting both dot (.) and slash (/) formats (e.g., 09.07.2026 -> 09/07/2026)
+# Smart date parser supporting both dot (.) and slash (/) formats
 def parse_date_to_custom_format(v):
     if pd.isna(v) or v is None: return ""
     s = str(v).replace(':', '').replace('Delivery Date', '').strip()
@@ -157,7 +162,7 @@ if excel_file and pdf_files:
                 "Item": types.Schema(type=types.Type.STRING, description="The drawing number or item string like '1237190 Rev: 01'"),
                 "Description": types.Schema(type=types.Type.STRING, description="Product item text name description"),
                 "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity numerical value count optionally with unit like '500 ST' or '100 pack'"),
-                "Unit_Price": types.Schema(type=types.Type.STRING, description="Price text including conditions, e.g., 'per 100 st 5,34' or '0,0534'"),
+                "Unit_Price": types.Schema(type=types.Type.STRING, description="Price text exactly as shown including bulk condition, e.g., 'per 100 st 5,34' or '0,0534'"),
                 "Required_Date": types.Schema(type=types.Type.STRING, description="Delivery Date string value")
             },
             required=["Item", "Order_Quantity", "Unit_Price"]
@@ -176,7 +181,7 @@ if excel_file and pdf_files:
         CRITICAL EXTRACTION RULES:
         1. Look closely at grouped lines (e.g., lines 3, 4, 5 or lines 8, 10). The item codes, line numbers, quantities, and prices may be listed sequentially separated by newlines in single column blocks, OR temporarily merged due to layout distortion (e.g., QTY and Price squeezed together like '5 EA\\n 582,16'). 
            YOU MUST UNPACK THEM completely and correctly split them up so that every individual item code gets its own separate JSON object in the output list.
-        2. Clean and capture the specific 'Order Quantity', 'Unit Price' (preserve full text mapping context like 'per 100 st 5,34'), and 'Delivery Date' fields associated with that item sequence rank position.
+        2. Clean and capture the specific 'Order Quantity', 'Unit Price' (preserve full text mapping context like 'per 100 st 5,34' or '/1000 50,00'), and 'Delivery Date' fields associated with that item sequence rank position.
         3. Extract the item part numbers wherever they sit (checking both the column headers and descriptions text blocks).
         """
 
@@ -280,11 +285,17 @@ if excel_file and pdf_files:
             excel_side_row = {col: row[col] for col in df_excel.columns}
             excel_side_row['Data Block Source'] = 'GloviaG2'
             
-            # Formats/cleans the Excel Quantity row display immediately (removes ,0000)
+            # 1. Standardize Excel Quantity Row (Removes trailing ,0000)
             if 'Order Quantity' in excel_side_row:
                 ex_qty_num, _ = parse_qty_and_unit(excel_side_row['Order Quantity'])
                 if ex_qty_num is not None:
                     excel_side_row['Order Quantity'] = str(ex_qty_num)
+            
+            # 2. Standardize Excel Unit Price Row
+            if 'Unit Price' in excel_side_row:
+                ex_price_num = normalize_price(excel_side_row['Unit Price'])
+                if ex_price_num is not None:
+                    excel_side_row['Unit Price'] = str(ex_price_num)
             
             if 'Required Date/Time' in excel_side_row:
                 excel_side_row['Required Date/Time'] = parse_date_to_custom_format(excel_side_row['Required Date/Time'])
@@ -323,10 +334,16 @@ if excel_file and pdf_files:
             
             if match is not None:
                 if 'Line' in df_excel.columns: pdf_side_row['Line'] = match.get('Line')
-                if 'Unit Price' in df_excel.columns: pdf_side_row['Unit Price'] = match.get('Unit_Price')
+                
+                # 3. Smart PDF Price Conversion & Visual Output
+                raw_pdf_price = match.get('Unit_Price')
+                calc_pdf_price = normalize_price(raw_pdf_price)
+                if 'Unit Price' in df_excel.columns: 
+                    pdf_side_row['Unit Price'] = str(calc_pdf_price) if calc_pdf_price is not None else raw_pdf_price
+                
                 if 'Required Date/Time' in df_excel.columns: pdf_side_row['Required Date/Time'] = parse_date_to_custom_format(match.get('Required_Date'))
                 
-                # Dynamic Extraction: Splits numeric part from unit (e.g. "500 ST" -> "500" & "ST")
+                # Dynamic Quantity Extraction
                 raw_pdf_qty = match.get('Order_Quantity')
                 cleaned_pdf_qty, extracted_unit = parse_qty_and_unit(raw_pdf_qty)
                 
@@ -354,7 +371,6 @@ if excel_file and pdf_files:
                     confirmation_note_text = f"{today_str} lla dd conf. {delivery_ddmmyy}"
             else:
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = "Not found in PO PDF"
-                # Keep unit intact from Excel if PDF item was missing completely
                 for um_col in ['UM', 'Stock UM', 'In Stock UM']:
                     if um_col in df_excel.columns:
                         pdf_side_row[um_col] = excel_side_row.get(um_col)
@@ -407,7 +423,7 @@ if excel_file and pdf_files:
             if is_missing_in_pdf:
                 continue
 
-            # Quantities Check (Using advanced parser to ignore ,0000 and unit formatting differences)
+            # Quantities Check 
             if idx_qty:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_qty), ws.cell(row=row_pdf_idx, column=idx_qty)
                 val_e, _ = parse_qty_and_unit(cell_e.value)
@@ -415,7 +431,7 @@ if excel_file and pdf_files:
                 if val_e != val_p and cell_p.value is not None:
                     cell_e.fill = fill_red; cell_p.fill = fill_red
 
-            # Unit Price Check 
+            # Unit Price Check (Comparing the visual values directly)
             if idx_price:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_price), ws.cell(row=row_pdf_idx, column=idx_price)
                 if normalize_price(cell_e.value) != normalize_price(cell_p.value) and cell_p.value is not None:
