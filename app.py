@@ -17,7 +17,7 @@ import pypdf  # Requirement: pip install pypdf
 # ==========================================
 st.set_page_config(page_title="PO Checker AI", layout="wide")
 st.title("📦 Purchase Order Checking Assistant")
-st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report with matching confirmation notes.")
+st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report with matching confirmation notes (Supports Split Delivery Schedules).")
 
 # Securely fetch API key
 if "GOOGLE_API_KEY" in st.secrets:
@@ -79,20 +79,15 @@ def parse_qty_and_unit(v):
 def normalize_price(v):
     if pd.isna(v) or v is None: return None
     s = str(v).lower().strip()
-    
-    # Clean up prefixes like 'à' from European formats
     s = s.replace('à', '')
     
-    # 1. Dynamically extract the bulk factor using Regex
     factor = 1.0
     match_factor = re.search(r'(?:per|/)\s*(\d+)', s)
     if match_factor:
         factor = float(match_factor.group(1))
         
-    # 2. Remove the bulk pricing text entirely
     s = re.sub(r'(?:per|/)\s*\d+\s*[a-z]*', '', s)
     
-    # 3. Clean up common currency and unit symbols
     for text_to_remove in ['st.', 'st', '€', 'eur', 'piece', 'pcs', 'ea', 'pack']:
         s = s.replace(text_to_remove, '')
     s = s.strip()
@@ -100,7 +95,6 @@ def normalize_price(v):
     if not s: return None
     if s.startswith(','): s = '0' + s
         
-    # 4. Standardize European/US decimal formats
     s = s.replace(' ', '')
     if ',' in s and '.' in s:
         if s.rfind(',') > s.rfind('.'): s = s.replace('.', '').replace(',', '.')
@@ -108,7 +102,6 @@ def normalize_price(v):
     elif ',' in s and '.' not in s:
         s = s.replace(',', '.')
         
-    # 5. Calculate final unit price and round to 4 decimal places
     try:
         unit_val = float(s)
         return round(unit_val / factor, 4)
@@ -156,18 +149,31 @@ if excel_file and pdf_files:
         if unnamed_col not in df_excel.columns:
             df_excel[unnamed_col] = None
 
+        # NEW SCHEMA: Nested delivery schedule to handle multi-date split delivery rules natively
+        schedule_item_schema = types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "Split_Quantity": types.Schema(type=types.Type.STRING, description="The specific partial quantity for this split date (e.g. '25 st')"),
+                "Required_Date": types.Schema(type=types.Type.STRING, description="The delivery date for this specific batch (e.g. '7-8-2026')")
+            },
+            required=["Split_Quantity", "Required_Date"]
+        )
+
         po_item_schema = types.Schema(
             type=types.Type.OBJECT,
             properties={
                 "Line": types.Schema(type=types.Type.STRING, description="Sequence position or row index number"),
-                "Item": types.Schema(type=types.Type.STRING, description="The primary item number listed under standard column (e.g. 500285)"),
-                "Customer_Item": types.Schema(type=types.Type.STRING, description="The buyer's part number often found in notes or labeled as 'Uw teknr', 'Your part no', or drawing codes (e.g. 4022 262 22021)"),
+                "Item": types.Schema(type=types.Type.STRING, description="The primary item number listed under standard column (e.g. 514214)"),
+                "Customer_Item": types.Schema(type=types.Type.STRING, description="The buyer's part number from notes labeled as 'Uw teknr', 'Your part no' (e.g. 4022.622.9146.3R103)"),
                 "Description": types.Schema(type=types.Type.STRING, description="Product item text name description"),
-                "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity optionally with unit (e.g., '30 st')"),
-                "Unit_Price": types.Schema(type=types.Type.STRING, description="Price text including conditions (e.g., '€ 916,16 per 1 st')"),
-                "Required_Date": types.Schema(type=types.Type.STRING, description="Delivery Date string value")
+                "Unit_Price": types.Schema(type=types.Type.STRING, description="Price text including conditions (e.g., '€ 1.423,61 per 1 st')"),
+                "Deliveries": types.Schema(
+                    type=types.Type.ARRAY, 
+                    items=schedule_item_schema, 
+                    description="List of all scheduled delivery dates and split quantities for this single line item."
+                )
             },
-            required=["Item", "Order_Quantity", "Unit_Price"]
+            required=["Item", "Unit_Price", "Deliveries"]
         )
 
         final_response_schema = types.Schema(
@@ -175,27 +181,21 @@ if excel_file and pdf_files:
             items=po_item_schema
         )
 
-        # ULTIMATE AGGREGATED EXTRACTION PROMPT
+        # PROMPT RE-TUNED FOR SPLIT DELIVERIES CAPTURE
         prompt = """
-        You are an elite Purchase Order parsing specialist handling complex, multi-lingual, and aggregated PDF layouts.
+        You are an elite Purchase Order parsing specialist handling complex multi-lingual layouts with split delivery dates.
         
         CRITICAL EXTRACTION RULES:
-        1. MULTI-LINGUAL HEADERS AWARENESS: 
-           - Look for 'Verzendschema', 'Leverdatum', 'Liefertermin', 'Shipping date' -> This is the 'Delivery Date' (`Required_Date`).
-           - Look for 'Aantal', 'Menge', 'Quantity' -> This section contains QTY and Price.
-           - Look for 'Omschrijving', 'Bezeichnung', 'Description' -> This is the Item Name/Description.
-        2. DUAL ITEM NUMBER EXTRACTION (CRITICAL):
-           - Standard line item tables might use a supplier part number (e.g., '500285') in the main 'Artikel' column.
-           - Scan the blocks right below or around it for the Buyer's Customer Part Number, frequently labeled as 'Uw teknr:', 'Your part No:', 'Drawing No:' (e.g., '4022 262 22021'). 
-           - Put the main number in `Item` and the drawing/customer part number in `Customer_Item`. Do NOT miss this block.
-        3. SMART SPLITTING OF COMBINED STRINGS:
-           - If Quantity and Price are grouped in one block (e.g., "30 st à € 916,16 per 1 st"), YOU MUST SPLIT IT:
-             `Order_Quantity` = "30 st"
-             `Unit_Price` = "€ 916,16 per 1 st"
-        4. RELATIVE POSITIONING:
-           - Item Names / Descriptions (e.g., "Z-Slide") are frequently placed DIRECTLY ABOVE or BELOW the actual part number. Read the surrounding vertical space carefully to capture the correct Description.
-        5. COMPLETENESS:
-           - Unpack everything completely so every individual item code gets its own JSON object. Ensure no dates, quantities, prices, or descriptions are missed due to language or vertical spacing.
+        1. SPLIT DELIVERIES / VERZENDSCHEMA (HIGHEST PRIORITY):
+           - A single line item might have multiple delivery dates and split quantities underneath 'Verzendschema:' or 'Delivery Schedule'.
+           - For example, if it states '25 st' on '7-8-2026' AND '25 st' on '21-8-2026', you MUST capture BOTH separate entries inside the `Deliveries` array.
+           - Do not skip subsequent dates or squash them into a single string.
+        2. DUAL ITEM NUMBER EXTRACTION:
+           - Scan standard columns for item numbers (e.g., '514214'). Also look at the descriptions/notes block right around it for the Customer Part Number labeled as 'Uw teknr:' (e.g., '4022 622 9146.3').
+           - Store standard in `Item` and buyer's code in `Customer_Item`.
+        3. MULTI-LINGUAL HEADERS:
+           - Look for 'Verzendschema', 'Leverdatum', 'Shipping date' -> Delivery dates.
+           - Look for 'Aantal', 'Menge', 'Quantity' -> Contains quantity and text prices (e.g., '50 st à € 1.423,61 per 1 st'). Extract the Unit Price accurately.
         """
 
         all_po_items = []
@@ -207,7 +207,6 @@ if excel_file and pdf_files:
             try:
                 pdf_file.seek(0)
                 pdf_bytes = pdf_file.read()
-                
                 if len(pdf_bytes) == 0: continue
 
                 pdf_reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
@@ -280,16 +279,19 @@ if excel_file and pdf_files:
             st.stop()
 
         df_po = pd.DataFrame(all_po_items)
-        st.write("🔄 Aligning and structuring report layout rows...")
+        st.write("🔄 Aligning and matching split-delivery rows into structural layout...")
 
         structured_rows = []
-        used_po_indices = set() 
         
+        # We track how rows are generated to highlight discrepancies accurately in openpyxl later
+        excel_row_blocks_meta = [] 
+
         for idx, row in df_excel.iterrows():
             excel_item = str(row.get(item_col_name, '')).strip()
             excel_key = clean_key(excel_item)
             ex_line = clean_line_num(row.get('Line'))
             
+            # 1. Standardize Glovia Master Row values
             excel_side_row = {col: row[col] for col in df_excel.columns}
             excel_side_row['Data Block Source'] = 'GloviaG2'
             
@@ -306,94 +308,123 @@ if excel_file and pdf_files:
             if 'Required Date/Time' in excel_side_row:
                 excel_side_row['Required Date/Time'] = parse_date_to_custom_format(excel_side_row['Required Date/Time'])
             
-            match = None
+            # 2. Look for matching candidates in the extracted PDF items pool
+            matched_po_item = None
             if not df_po.empty and excel_key:
                 candidates = []
                 for po_idx, po_row in df_po.iterrows():
-                    po_item = str(po_row.get('Item', '')).strip()
-                    po_cust_item = str(po_row.get('Customer_Item', '')).strip()
-                    po_desc = str(po_row.get('Description', '')).strip()
+                    po_key_p = clean_key(po_row.get('Item', ''))
+                    po_key_c = clean_key(po_row.get('Customer_Item', ''))
+                    po_key_d = clean_key(po_row.get('Description', ''))
                     
-                    po_key_primary = clean_key(po_item)
-                    po_key_customer = clean_key(po_cust_item)
-                    po_key_desc = clean_key(po_desc)
-                    
-                    # Enhanced 3D matching logic: Check primary item number, secondary customer number, or descriptions
-                    if ((po_key_primary and (po_key_primary in excel_key or excel_key in po_key_primary)) or 
-                        (po_key_customer and (po_key_customer in excel_key or excel_key in po_key_customer)) or 
-                        (excel_key and excel_key in po_key_desc)):
-                        candidates.append((po_idx, po_row))
+                    if (po_key_p and (po_key_p in excel_key or excel_key in po_key_p)) or \
+                       (po_key_c and (po_key_c in excel_key or excel_key in po_key_c)) or \
+                       (excel_key and excel_key in po_key_d):
+                        candidates.append(po_row)
                 
                 if candidates:
-                    for po_idx, po_row in candidates:
-                        if clean_line_num(po_row.get('Line')) == ex_line and po_idx not in used_po_indices:
-                            match = po_row
-                            used_po_indices.add(po_idx)
+                    matched_po_item = candidates[0]
+                    for cand in candidates:
+                        if clean_line_num(cand.get('Line')) == ex_line:
+                            matched_po_item = cand
                             break
-                    if match is None:
-                        for po_idx, po_row in candidates:
-                            if po_idx not in used_po_indices:
-                                match = po_row
-                                used_po_indices.add(po_idx)
-                                break
-                    if match is None:
-                        match = candidates[0][1]
 
-            pdf_side_row = {col: None for col in df_excel.columns}
-            pdf_side_row['Data Block Source'] = 'PDF'
-            pdf_side_row[item_col_name] = excel_item
-            confirmation_note_text = ""
+            # 3. Handle data rendering depending on if item is found or contains multiple deliveries
+            block_start_index = len(structured_rows)
             
-            if match is not None:
-                if 'Line' in df_excel.columns: pdf_side_row['Line'] = match.get('Line')
+            if matched_po_item is not None:
+                deliveries = matched_po_item.get('Deliveries', [])
+                if not isinstance(deliveries, list) or len(deliveries) == 0:
+                    deliveries = [{"Split_Quantity": "0", "Required_Date": ""}]
                 
-                raw_pdf_price = match.get('Unit_Price')
-                calc_pdf_price = normalize_price(raw_pdf_price)
-                if 'Unit Price' in df_excel.columns: 
-                    pdf_side_row['Unit Price'] = str(calc_pdf_price) if calc_pdf_price is not None else raw_pdf_price
-                
-                if 'Required Date/Time' in df_excel.columns: 
-                    pdf_side_row['Required Date/Time'] = parse_date_to_custom_format(match.get('Required_Date'))
-                
-                raw_pdf_qty = match.get('Order_Quantity')
-                cleaned_pdf_qty, extracted_unit = parse_qty_and_unit(raw_pdf_qty)
-                
-                if 'Order Quantity' in df_excel.columns: 
-                    pdf_side_row['Order Quantity'] = str(cleaned_pdf_qty) if cleaned_pdf_qty is not None else raw_pdf_qty
-                
-                for um_col in ['UM', 'Stock UM', 'In Stock UM']:
-                    if um_col in df_excel.columns:
-                        pdf_side_row[um_col] = extracted_unit if extracted_unit else excel_side_row.get(um_col)
+                # We calculate aggregate quantity across all splits to check if sum total matches system
+                total_pdf_item_qty = 0
+                for d in deliveries:
+                    q_num, _ = parse_qty_and_unit(d.get('Split_Quantity', '0'))
+                    if q_num: total_pdf_item_qty += q_num
+
+                # Append Glovia row first
+                excel_side_row['Confirmation Note'] = "" # Will fill if single match or leave for splits
+                structured_rows.append(excel_side_row)
+
+                # Append a distinct line for EACH split delivery date found under the same item code!
+                for d_idx, deliv in enumerate(deliveries):
+                    pdf_side_row = {col: None for col in df_excel.columns}
+                    pdf_side_row['Data Block Source'] = 'PDF'
+                    pdf_side_row[item_col_name] = excel_item
+                    if 'Line' in df_excel.columns: pdf_side_row['Line'] = matched_po_item.get('Line')
+                    
+                    # Map static fields
+                    raw_price = matched_po_item.get('Unit_Price')
+                    calc_price = normalize_price(raw_price)
+                    if 'Unit Price' in df_excel.columns:
+                        pdf_side_row['Unit Price'] = str(calc_price) if calc_price is not None else raw_price
                         
-                pdf_side_row[unnamed_col] = match.get('Description', 'No Description')
-                if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = f"Extracted from PDF: {match.get('PO_Source_File', '')}"
+                    pdf_side_row[unnamed_col] = matched_po_item.get('Description', 'No Description')
+                    if 'Notes' in df_excel.columns: 
+                        pdf_side_row['Notes'] = f"Extracted from PDF: {matched_po_item.get('PO_Source_File', '')} [Batch {d_idx+1}]"
+                    
+                    # Map dynamic schedule fields
+                    raw_split_qty = deliv.get('Split_Quantity')
+                    clean_split_qty, extracted_unit = parse_qty_and_unit(raw_split_qty)
+                    if 'Order Quantity' in df_excel.columns:
+                        pdf_side_row['Order Quantity'] = str(clean_split_qty) if clean_split_qty is not None else raw_split_qty
+                        
+                    for um_col in ['UM', 'Stock UM', 'In Stock UM']:
+                        if um_col in df_excel.columns:
+                            pdf_side_row[um_col] = extracted_unit if extracted_unit else excel_side_row.get(um_col)
+
+                    formatted_deliv_date = parse_date_to_custom_format(deliv.get('Required_Date'))
+                    if 'Required Date/Time' in df_excel.columns:
+                        pdf_side_row['Required Date/Time'] = formatted_deliv_date
+
+                    # Build targeted Confirmation Notes text format: DDMY
+                    conf_text = ""
+                    if formatted_deliv_date:
+                        today_str = datetime.now().strftime("%d%m")
+                        ddmmyy = ""
+                        if '/' in formatted_deliv_date:
+                            parts = formatted_deliv_date.split('/')
+                            if len(parts) >= 3: ddmmyy = parts[0] + parts[1] + parts[2][-2:]
+                        conf_text = f"{today_str} lla dd conf. {ddmmyy}"
+                    
+                    pdf_side_row['Confirmation Note'] = conf_text
+                    structured_rows.append(pdf_side_row)
                 
-                pdf_date = parse_date_to_custom_format(match.get('Required_Date'))
-                if pdf_date and str(pdf_date).strip() != "":
-                    today_str = datetime.now().strftime("%d%m")
-                    delivery_ddmmyy = ""
-                    pdf_date_str = str(pdf_date).strip()
-                    if '/' in pdf_date_str:
-                        date_parts = pdf_date_str.split('/')
-                        if len(date_parts) >= 3:
-                            delivery_ddmmyy = date_parts[0] + date_parts[1] + date_parts[2][-2:]
-                    confirmation_note_text = f"{today_str} lla dd conf. {delivery_ddmmyy}"
+                block_end_index = len(structured_rows)
+                excel_row_blocks_meta.append({
+                    "type": "MATCHED",
+                    "start": block_start_index,
+                    "end": block_end_index,
+                    "total_pdf_qty": total_pdf_item_qty
+                })
             else:
+                # Completely missing from PDF
+                if 'Notes' in df_excel.columns: excel_side_row['Notes'] = ""
+                excel_side_row['Confirmation Note'] = ""
+                structured_rows.append(excel_side_row)
+                
+                pdf_side_row = {col: None for col in df_excel.columns}
+                pdf_side_row['Data Block Source'] = 'PDF'
+                pdf_side_row[item_col_name] = excel_item
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = "Not found in PO PDF"
                 for um_col in ['UM', 'Stock UM', 'In Stock UM']:
-                    if um_col in df_excel.columns:
-                        pdf_side_row[um_col] = excel_side_row.get(um_col)
-            
-            excel_side_row['Confirmation Note'] = confirmation_note_text
-            pdf_side_row['Confirmation Note'] = confirmation_note_text
-            
-            blank_spacer_row = {col: None for col in df_excel.columns}
-            blank_spacer_row['Data Block Source'] = None
-            blank_spacer_row['Confirmation Note'] = None
-            
-            structured_rows.append(excel_side_row)
-            structured_rows.append(pdf_side_row)
-            structured_rows.append(blank_spacer_row)
+                    if um_col in df_excel.columns: pdf_side_row[um_col] = excel_side_row.get(um_col)
+                structured_rows.append(pdf_side_row)
+                
+                block_end_index = len(structured_rows)
+                excel_row_blocks_meta.append({
+                    "type": "MISSING",
+                    "start": block_start_index,
+                    "end": block_end_index,
+                    "total_pdf_qty": 0
+                })
+
+            # Append trailing spacing row
+            blank_row = {col: None for col in df_excel.columns}
+            blank_row['Data Block Source'] = None
+            blank_row['Confirmation Note'] = None
+            structured_rows.append(blank_row)
 
         df_final = pd.DataFrame(structured_rows)
         core_cols = [c for c in df_final.columns if c not in ['Data Block Source', 'Confirmation Note']]
@@ -401,7 +432,7 @@ if excel_file and pdf_files:
         df_final = df_final[cols]
         df_final.to_excel(OUTPUT_FILENAME, index=False)
 
-        # Style and Highlight discrepancies via OpenPyXL
+        # Style and Highlight via OpenPyXL using dynamic cell blocks metadata
         wb = openpyxl.load_workbook(OUTPUT_FILENAME)
         ws = wb.active
         headers = [cell.value for cell in ws[1]]
@@ -409,50 +440,61 @@ if excel_file and pdf_files:
         idx_qty = headers.index('Order Quantity') + 1 if 'Order Quantity' in headers else None
         idx_price = headers.index('Unit Price') + 1 if 'Unit Price' in headers else None
         idx_date = headers.index('Required Date/Time') + 1 if 'Required Date/Time' in headers else None
-        idx_notes = headers.index('Notes') + 1 if 'Notes' in headers else None
 
         fill_red = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
         fill_light_gray = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid')
         fill_yellow = PatternFill(start_color='FFFFCC', end_color='FFFFCC', fill_type='solid')
         
-        for i in range(len(df_excel)):
-            row_excel_idx = (i * 3) + 2
-            row_pdf_idx = (i * 3) + 3
+        for block in excel_row_blocks_meta:
+            start_r = block["start"] + 2 # offset spreadsheet header
+            end_r = block["end"] + 1
             
-            is_missing_in_pdf = False
-            if idx_notes:
-                notes_val = ws.cell(row=row_pdf_idx, column=idx_notes).value
-                if notes_val == "Not found in PO PDF":
-                    is_missing_in_pdf = True
+            # Glovia Row is always the first index of the structured block
+            glovia_row_num = start_r
+            
+            if block["type"] == "MISSING":
+                for r in range(start_r, end_r):
+                    for c in range(1, len(headers) + 1):
+                        ws.cell(row=r, column=c).fill = fill_yellow
+                continue
+            
+            # Style standard matching rows block gray
+            for r in range(start_r, end_r):
+                for c in range(1, len(headers) + 1):
+                    ws.cell(row=r, column=c).fill = fill_light_gray
+            
+            # Validate pricing and quantities safely against split groups
+            ex_qty_val, _ = parse_qty_and_unit(ws.cell(row=glovia_row_num, column=idx_qty).value if idx_qty else 0)
+            ex_price_val = normalize_price(ws.cell(row=glovia_row_num, column=idx_price).value if idx_price else 0)
+            ex_date_val = str(ws.cell(row=glovia_row_num, column=idx_date).value).strip() if idx_date else ""
 
-            current_base_fill = fill_yellow if is_missing_in_pdf else fill_light_gray
-            for col_idx in range(1, len(headers) + 1):
-                ws.cell(row=row_excel_idx, column=col_idx).fill = current_base_fill
+            # Check if total sum quantity matches system target requirement
+            qty_discrepancy = (ex_qty_val != block["total_pdf_qty"])
 
-            if is_missing_in_pdf: continue
-
-            if idx_qty:
-                cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_qty), ws.cell(row=row_pdf_idx, column=idx_qty)
-                val_e, _ = parse_qty_and_unit(cell_e.value)
-                val_p, _ = parse_qty_and_unit(cell_p.value)
-                if val_e != val_p and cell_p.value is not None:
-                    cell_e.fill = fill_red; cell_p.fill = fill_red
-
-            if idx_price:
-                cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_price), ws.cell(row=row_pdf_idx, column=idx_price)
-                if normalize_price(cell_e.value) != normalize_price(cell_p.value) and cell_p.value is not None:
-                    cell_e.fill = fill_red; cell_p.fill = fill_red
+            # Evaluate each individual PDF row sub-entry
+            for pdf_row_num in range(glovia_row_num + 1, end_r):
+                if idx_qty and qty_discrepancy:
+                    ws.cell(row=glovia_row_num, column=idx_qty).fill = fill_red
+                    ws.cell(row=pdf_row_num, column=idx_qty).fill = fill_red
                     
-            if idx_date:
-                cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_date), ws.cell(row=row_pdf_idx, column=idx_date)
-                if cell_e.value != cell_p.value and cell_p.value is not None and cell_p.value != "":
-                    cell_e.fill = fill_red; cell_p.fill = fill_red
+                if idx_price:
+                    p_cell = ws.cell(row=pdf_row_num, column=idx_price)
+                    if ex_price_val != normalize_price(p_cell.value) and p_cell.value is not None:
+                        ws.cell(row=glovia_row_num, column=idx_price).fill = fill_red
+                        p_cell.fill = fill_red
+                        
+                if idx_date:
+                    d_cell = ws.cell(row=pdf_row_num, column=idx_date)
+                    # For split delivery, individual date variances are natural but highlighted if distinct from original master row target
+                    if ex_date_val != str(d_cell.value).strip() and d_cell.value is not None and d_cell.value != "":
+                        # We flag date cell soft yellow or red if it shifts from target
+                        d_cell.fill = fill_red
 
         excel_buffer = io.BytesIO()
         wb.save(excel_buffer)
         excel_buffer.seek(0)
 
-        st.success("🎉 Process Complete!")
+        st.success("🎉 Process Complete with Split Schedules Unpacked!")
         st.download_button(
             label="📥 Download Discrepancy Report",
             data=excel_buffer,
