@@ -9,10 +9,10 @@ from google.genai import types
 import openpyxl
 from openpyxl.styles import PatternFill
 import streamlit as st
-import pypdf  # 記得先在環境中執行 pip install pypdf
+import pypdf  # Requirement: pip install pypdf
 
 # ==========================================
-# APP CONFIGURATION & UI SETUP
+# APP CONFIGURATION & UI SETUP (ALL ENGLISH)
 # ==========================================
 st.set_page_config(page_title="PO Checker AI", layout="centered")
 st.title("📦 Purchase Order Checking Assistant")
@@ -22,7 +22,7 @@ st.write("Upload your System Master Data and PO PDFs to automatically generate a
 if "GOOGLE_API_KEY" in st.secrets:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 else:
-    st.error("🔑 Google API Key 尚未設定！請在 Streamlit 的 Secrets 中進行配置。")
+    st.error("🔑 Google API Key is not set! Please configure it within Streamlit Secrets.")
     st.stop()
 
 client = genai.Client(api_key=GOOGLE_API_KEY)
@@ -41,6 +41,7 @@ def clean_line_num(val):
     if pd.isna(val) or val is None: return ""
     return str(val).strip().split('-')[0].strip().lstrip('0')
 
+# Standard numeric normalizer for quantities
 def normalize_numeric(v):
     if pd.isna(v) or v is None: return None
     try:
@@ -52,12 +53,52 @@ def normalize_numeric(v):
     except:
         return None
 
-# Custom date parser to output strictly DD/MM/YYYY
+# NEW: Smart Price Normalizer to handle currency formatting and bulk rates (e.g., "per 100 st 5,34" vs "0,0534")
+def normalize_price(v):
+    if pd.isna(v) or v is None: return None
+    s = str(v).lower().strip()
+    
+    # Detect if the price is a bulk rate (per 100 or per 1000)
+    factor = 1.0
+    if "per 100" in s or "/100" in s or "per100" in s:
+        factor = 100.0
+    elif "per 1000" in s or "/1000" in s or "per1000" in s:
+        factor = 1000.0
+        
+    # Strip common suffixes and unit strings
+    for text_to_remove in ['st.', 'st', '€', 'eur', 'per 1000', 'per 100', 'per1000', 'per100', 'ex works', 'piece', 'pcs']:
+        s = s.replace(text_to_remove, '')
+    s = s.strip()
+    
+    if not s: return None
+    
+    # Standardize leading commas (e.g., ",0534" -> "0,0534")
+    if s.startswith(','):
+        s = '0' + s
+        
+    # Handle European vs US decimal separators
+    if ',' in s and '.' in s:
+        if s.rfind(',') > s.rfind('.'):
+            s = s.replace('.', '').replace(',', '.')
+        else:
+            s = s.replace(',', '')
+    elif ',' in s and '.' not in s:
+        s = s.replace(',', '.')
+        
+    try:
+        unit_val = float(s)
+        # Calculate single unit price and round to 4 decimal points for high precision
+        return round(unit_val / factor, 4)
+    except:
+        return None
+
+# ENHANCED: Smart date parser supporting both dot (.) and slash (/) formats (e.g., 09.07.2026 -> 09/07/2026)
 def parse_date_to_custom_format(v):
     if pd.isna(v) or v is None: return ""
     s = str(v).replace(':', '').replace('Delivery Date', '').strip()
+    s = s.replace('.', '/')  # Seamlessly converts 09.07.2026 into 09/07/2026
     s = s.split(',')[0].strip().split()[0]
-    for fmt in ('%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y', '%Y/%m/%d'):
+    for fmt in ('%d/%m/%Y', '%Y/%m/%d', '%m/%d/%Y', '%d-%m-%Y', '%Y-%m-%d'):
         try: 
             return pd.to_datetime(s, format=fmt).strftime('%d/%m/%Y')
         except: 
@@ -65,7 +106,7 @@ def parse_date_to_custom_format(v):
     return str(v).strip()
 
 # ==========================================
-# UI FILE UPLOADERS
+# UI FILE UPLOADERS (ALL ENGLISH)
 # ==========================================
 excel_file = st.file_uploader("👉 Step 1: Upload System Master Data (Excel or CSV)", type=["xlsx", "xls", "csv"], key="master_data_excel_csv")
 pdf_files = st.file_uploader("👉 Step 2: Upload PO PDF file(s)", type=["pdf"], accept_multiple_files=True, key="po_pdf_files_list")
@@ -101,7 +142,7 @@ if excel_file and pdf_files:
                 "Item": types.Schema(type=types.Type.STRING, description="The drawing number or item string like '1237190 Rev: 01'"),
                 "Description": types.Schema(type=types.Type.STRING, description="Product item text name description"),
                 "Order_Quantity": types.Schema(type=types.Type.STRING, description="Quantity numerical value count"),
-                "Unit_Price": types.Schema(type=types.Type.STRING, description="Price per piece numeric value"),
+                "Unit_Price": types.Schema(type=types.Type.STRING, description="Price text including conditions, e.g., 'per 100 st 5,34' or '0,0534'"),
                 "Required_Date": types.Schema(type=types.Type.STRING, description="Delivery Date string value")
             },
             required=["Item", "Order_Quantity", "Unit_Price"]
@@ -112,7 +153,7 @@ if excel_file and pdf_files:
             items=po_item_schema
         )
 
-        # 增強版提示詞，應對長文件與錯位排版
+        # Advanced prompting for multi-page document layout parsing
         prompt = """
         You are a meticulous purchase order parsing specialist working with multi-line aggregated layouts.
         This PDF documents text-tracks by grouping multiple records vertically in single rows.
@@ -120,7 +161,7 @@ if excel_file and pdf_files:
         CRITICAL EXTRACTION RULES:
         1. Look closely at grouped lines (e.g., lines 3, 4, 5 or lines 8, 10). The item codes, line numbers, quantities, and prices may be listed sequentially separated by newlines in single column blocks, OR temporarily merged due to layout distortion (e.g., QTY and Price squeezed together like '5 EA\\n 582,16'). 
            YOU MUST UNPACK THEM completely and correctly split them up so that every individual item code gets its own separate JSON object in the output list.
-        2. Clean and capture the specific 'Order Quantity', 'Unit Price', and 'Delivery Date' fields associated with that item sequence rank position.
+        2. Clean and capture the specific 'Order Quantity', 'Unit Price' (preserve full text mapping context like 'per 100 st 5,34'), and 'Delivery Date' fields associated with that item sequence rank position.
         3. Extract the item part numbers wherever they sit (checking both the column headers and descriptions text blocks).
         """
 
@@ -129,7 +170,7 @@ if excel_file and pdf_files:
         quota_exhausted = False
         
         for idx, pdf_file in enumerate(pdf_files):
-            st.write(f"🔍 AI 正在處理檔案: **{pdf_file.name}**")
+            st.write(f"🔍 AI is processing file: **{pdf_file.name}**")
             try:
                 pdf_file.seek(0)
                 pdf_bytes = pdf_file.read()
@@ -137,16 +178,16 @@ if excel_file and pdf_files:
                 if len(pdf_bytes) == 0:
                     continue
 
-                # --- 使用 pypdf 進行長文件分頁讀取 (每次處理 2 頁) ---
+                # --- Using pypdf for long file page chunking (2 pages per batch) ---
                 pdf_reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
                 total_pages = len(pdf_reader.pages)
                 pages_per_chunk = 2 
                 
                 for start_page in range(0, total_pages, pages_per_chunk):
                     end_page = min(start_page + pages_per_chunk, total_pages)
-                    st.write(f"   📄 正在解析第 {start_page + 1} 至 {end_page} 頁 (總共 {total_pages} 頁)...")
+                    st.write(f"   📄 Parsing pages {start_page + 1} to {end_page} (Total: {total_pages} pages)...")
                     
-                    # 建立分頁暫存 PDF
+                    # Create temporary page chunk PDF
                     pdf_writer = pypdf.PdfWriter()
                     for p_idx in range(start_page, end_page):
                         pdf_writer.add_page(pdf_reader.pages[p_idx])
@@ -180,7 +221,7 @@ if excel_file and pdf_files:
                             
                             # Handle Hard Daily Limit Cap Exceeded
                             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                                st.error("🛑 **Daily Quota Limit Reached (429)!** Your Gemini Free Tier account allows a maximum of 20 requests per day. To remove this limit, switch your project to Pay-As-You-Go billing in Google AI Studio, or use an API Key from a different Google account.")
+                                st.error("🛑 **Daily Quota Limit Reached (429)!** Your Gemini account configuration limit has been met.")
                                 quota_exhausted = True
                                 break
                             
@@ -196,17 +237,16 @@ if excel_file and pdf_files:
                     if quota_exhausted:
                         st.stop()
                         
-                    # 解析當前 Chunk 回傳的 JSON
+                    # Parse returned chunked output
                     if response and response.text:
                         try:
                             items_data = json.loads(response.text.strip())
                             for item in items_data:
                                 item['PO_Source_File'] = pdf_file.name
                                 all_po_items.append(item)
-                        except json.JSONDecodeError as je:
-                            st.warning(f"⚠️ 第 {start_page+1}-{end_page} 頁的 JSON 格式解析失敗，已自動跳過此區間。")
+                        except json.JSONDecodeError:
+                            st.warning(f"⚠️ Failed to parse JSON for pages {start_page+1}-{end_page}, automatically skipping this chunk.")
                     
-                    # 避免連續請求太快，加入小緩衝
                     time.sleep(2)
                         
             except Exception as e:
@@ -219,7 +259,7 @@ if excel_file and pdf_files:
             st.stop()
 
         df_po = pd.DataFrame(all_po_items)
-        st.write("🔄 Alternating and structuring report layout rows...")
+        st.write("🔄 Aligning and structuring report layout rows...")
 
         structured_rows = []
         used_po_indices = set() 
@@ -243,21 +283,18 @@ if excel_file and pdf_files:
                     po_key = clean_key(po_item)
                     po_desc_key = clean_key(po_row.get('Description', ''))
                     
+                    # Match on Part Numbers / Item Code / Description match
                     if (po_key and (po_key in excel_key or excel_key in po_key)) or (excel_key and excel_key in po_desc_key):
                         candidates.append((po_idx, po_row))
                 
                 if candidates:
+                    # SMART PAIRING: First see if there's a matching line convention
                     for po_idx, po_row in candidates:
                         if clean_line_num(po_row.get('Line')) == ex_line and po_idx not in used_po_indices:
                             match = po_row
                             used_po_indices.add(po_idx)
                             break
-                    if match is None:
-                        for po_idx, po_row in candidates:
-                            if clean_line_num(po_row.get('Line')) == ex_line:
-                                match = po_row
-                                used_po_indices.add(po_idx)
-                                break
+                    # LENIENT FALLBACK: If Line number convention differs (e.g. 0001 vs 10) but item is identical, bind them together!
                     if match is None:
                         for po_idx, po_row in candidates:
                             if po_idx not in used_po_indices:
@@ -281,15 +318,9 @@ if excel_file and pdf_files:
                 pdf_side_row[unnamed_col] = match.get('Description', 'No Description')
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = f"Extracted from PDF: {match.get('PO_Source_File', '')}"
                 
-                pdf_line = clean_line_num(match.get('Line'))
-                ex_qty = normalize_numeric(row.get('Order Quantity'))
-                pdf_qty = normalize_numeric(match.get('Order_Quantity'))
-                ex_price = normalize_numeric(row.get('Unit Price'))
-                pdf_price = normalize_numeric(match.get('Unit_Price'))
-                ex_date = parse_date_to_custom_format(row.get('Required Date/Time'))
                 pdf_date = parse_date_to_custom_format(match.get('Required_Date'))
                 
-                # --- [安全防呆加強版邏輯] ---
+                # Automated Auto-Confirmation string tracking
                 if pdf_date and str(pdf_date).strip() != "":
                     today_str = datetime.now().strftime("%d%m")
                     delivery_ddmmyy = ""
@@ -299,23 +330,14 @@ if excel_file and pdf_files:
                         date_parts = pdf_date_str.split('/')
                         if len(date_parts) >= 3:
                             delivery_ddmmyy = date_parts[0] + date_parts[1] + date_parts[2][-2:]
-                        else:
-                            digits = "".join([c for c in pdf_date_str if c.isdigit()])
-                            if len(digits) >= 8:
-                                delivery_ddmmyy = digits[:4] + digits[-2:]
-                            elif len(digits) >= 6:
-                                delivery_ddmmyy = digits[:6]
-                            else:
-                                delivery_ddmmyy = digits
                     else:
                         digits = "".join([c for c in pdf_date_str if c.isdigit()])
-                        if len(digits) >= 8:
+                        if len(digits) >= 6:
                             delivery_ddmmyy = digits[:4] + digits[-2:]
                         else:
-                            delivery_ddmmyy = digits[:6]
+                            delivery_ddmmyy = digits
                         
                     confirmation_note_text = f"{today_str} lla dd conf. {delivery_ddmmyy}"
-
             else:
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = "Not found in PO PDF"
             
@@ -337,12 +359,11 @@ if excel_file and pdf_files:
         df_final = df_final[cols]
         df_final.to_excel(OUTPUT_FILENAME, index=False)
 
-        # Style and Highlight via OpenPyXL cell indexing
+        # Style and Highlight discrepancies via OpenPyXL
         wb = openpyxl.load_workbook(OUTPUT_FILENAME)
         ws = wb.active
         headers = [cell.value for cell in ws[1]]
 
-        idx_line = headers.index('Line') + 1 if 'Line' in headers else None
         idx_qty = headers.index('Order Quantity') + 1 if 'Order Quantity' in headers else None
         idx_price = headers.index('Unit Price') + 1 if 'Unit Price' in headers else None
         idx_date = headers.index('Required Date/Time') + 1 if 'Required Date/Time' in headers else None
@@ -369,21 +390,19 @@ if excel_file and pdf_files:
             if is_missing_in_pdf:
                 continue
 
-            if idx_line:
-                cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_line), ws.cell(row=row_pdf_idx, column=idx_line)
-                if clean_line_num(cell_e.value) != clean_line_num(cell_p.value) and cell_p.value is not None:
-                    cell_e.fill = fill_red; cell_p.fill = fill_red
-
+            # Quantities Check
             if idx_qty:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_qty), ws.cell(row=row_pdf_idx, column=idx_qty)
                 if normalize_numeric(cell_e.value) != normalize_numeric(cell_p.value) and cell_p.value is not None:
                     cell_e.fill = fill_red; cell_p.fill = fill_red
 
+            # SMART RECONCILIATION: Check Unit Price using the upgraded conversion helper
             if idx_price:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_price), ws.cell(row=row_pdf_idx, column=idx_price)
-                if normalize_numeric(cell_e.value) != normalize_numeric(cell_p.value) and cell_p.value is not None:
+                if normalize_price(cell_e.value) != normalize_price(cell_p.value) and cell_p.value is not None:
                     cell_e.fill = fill_red; cell_p.fill = fill_red
                     
+            # Dates Check (Now supports both dots and slashes seamlessly)
             if idx_date:
                 cell_e, cell_p = ws.cell(row=row_excel_idx, column=idx_date), ws.cell(row=row_pdf_idx, column=idx_date)
                 if cell_e.value != cell_p.value and cell_p.value is not None and cell_p.value != "":
