@@ -9,6 +9,7 @@ from google.genai import types
 import openpyxl
 from openpyxl.styles import PatternFill
 import streamlit as st
+import pypdf  # 記得先在環境中執行 pip install pypdf
 
 # ==========================================
 # APP CONFIGURATION & UI SETUP
@@ -18,7 +19,6 @@ st.title("📦 Purchase Order Checking Assistant")
 st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report with matching confirmation notes.")
 
 # Securely fetch API key
-# 修改後的安全寫法（✅ 從 Secrets 讀取）
 if "GOOGLE_API_KEY" in st.secrets:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 else:
@@ -112,13 +112,14 @@ if excel_file and pdf_files:
             items=po_item_schema
         )
 
+        # 增強版提示詞，應對長文件與錯位排版
         prompt = """
         You are a meticulous purchase order parsing specialist working with multi-line aggregated layouts.
         This PDF documents text-tracks by grouping multiple records vertically in single rows.
         
         CRITICAL EXTRACTION RULES:
-        1. Look closely at grouped lines (e.g., lines 3, 4, 5 or lines 8, 10). The item codes, line numbers, quantities, and prices are listed sequentially separated by newlines in single column blocks. 
-           YOU MUST UNPACK THEM completely! Split them up so that every individual item code gets its own separate JSON object in the output list.
+        1. Look closely at grouped lines (e.g., lines 3, 4, 5 or lines 8, 10). The item codes, line numbers, quantities, and prices may be listed sequentially separated by newlines in single column blocks, OR temporarily merged due to layout distortion (e.g., QTY and Price squeezed together like '5 EA\\n 582,16'). 
+           YOU MUST UNPACK THEM completely and correctly split them up so that every individual item code gets its own separate JSON object in the output list.
         2. Clean and capture the specific 'Order Quantity', 'Unit Price', and 'Delivery Date' fields associated with that item sequence rank position.
         3. Extract the item part numbers wherever they sit (checking both the column headers and descriptions text blocks).
         """
@@ -128,7 +129,7 @@ if excel_file and pdf_files:
         quota_exhausted = False
         
         for idx, pdf_file in enumerate(pdf_files):
-            st.write(f"🔍 AI is processing: **{pdf_file.name}**")
+            st.write(f"🔍 AI 正在處理檔案: **{pdf_file.name}**")
             try:
                 pdf_file.seek(0)
                 pdf_bytes = pdf_file.read()
@@ -136,58 +137,82 @@ if excel_file and pdf_files:
                 if len(pdf_bytes) == 0:
                     continue
 
-                # --- PROTECTED API CALL WITH EMBEDDED RETRY LOGIC ---
-                max_retries = 4
-                retry_delay = 4  
-                response = None
+                # --- 使用 pypdf 進行長文件分頁讀取 (每次處理 2 頁) ---
+                pdf_reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+                total_pages = len(pdf_reader.pages)
+                pages_per_chunk = 2 
                 
-                for attempt in range(max_retries):
-                    try:
-                        response = client.models.generate_content(
-                            model='gemini-2.5-flash',
-                            contents=[
-                                types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'),
-                                prompt
-                            ],
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                response_schema=final_response_schema,
-                                temperature=0.0
+                for start_page in range(0, total_pages, pages_per_chunk):
+                    end_page = min(start_page + pages_per_chunk, total_pages)
+                    st.write(f"   📄 正在解析第 {start_page + 1} 至 {end_page} 頁 (總共 {total_pages} 頁)...")
+                    
+                    # 建立分頁暫存 PDF
+                    pdf_writer = pypdf.PdfWriter()
+                    for p_idx in range(start_page, end_page):
+                        pdf_writer.add_page(pdf_reader.pages[p_idx])
+                    
+                    chunk_buffer = io.BytesIO()
+                    pdf_writer.write(chunk_buffer)
+                    chunk_bytes = chunk_buffer.getvalue()
+
+                    # --- PROTECTED API CALL WITH EMBEDDED RETRY LOGIC ---
+                    max_retries = 4
+                    retry_delay = 4  
+                    response = None
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            response = client.models.generate_content(
+                                model='gemini-2.5-flash',
+                                contents=[
+                                    types.Part.from_bytes(data=chunk_bytes, mime_type='application/pdf'),
+                                    prompt
+                                ],
+                                config=types.GenerateContentConfig(
+                                    response_mime_type="application/json",
+                                    response_schema=final_response_schema,
+                                    temperature=0.0
+                                )
                             )
-                        )
-                        break  
-                    except Exception as api_err:
-                        err_msg = str(api_err)
-                        
-                        # Handle Hard Daily Limit Cap Exceeded
-                        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                            st.error("🛑 **Daily Quota Limit Reached (429)!** Your Gemini Free Tier account allows a maximum of 20 requests per day. To remove this limit, switch your project to Pay-As-You-Go billing in Google AI Studio, or use an API Key from a different Google account.")
-                            quota_exhausted = True
-                            break
-                        
-                        # Handle Server Busy
-                        if "503" in err_msg or "UNAVAILABLE" in err_msg:
-                            if attempt < max_retries - 1:
-                                st.warning(f"⏳ Server overloaded (503). Retrying file {pdf_file.name} in {retry_delay}s... (Attempt {attempt + 1}/{max_retries})")
-                                time.sleep(retry_delay)
-                                retry_delay *= 2  
-                                continue
-                        raise api_err  
-                
-                if quota_exhausted:
-                    st.stop()
+                            break  
+                        except Exception as api_err:
+                            err_msg = str(api_err)
+                            
+                            # Handle Hard Daily Limit Cap Exceeded
+                            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                                st.error("🛑 **Daily Quota Limit Reached (429)!** Your Gemini Free Tier account allows a maximum of 20 requests per day. To remove this limit, switch your project to Pay-As-You-Go billing in Google AI Studio, or use an API Key from a different Google account.")
+                                quota_exhausted = True
+                                break
+                            
+                            # Handle Server Busy
+                            if "503" in err_msg or "UNAVAILABLE" in err_msg:
+                                if attempt < max_retries - 1:
+                                    st.warning(f"⏳ Server overloaded (503). Retrying chunk in {retry_delay}s... (Attempt {attempt + 1}/{max_retries})")
+                                    time.sleep(retry_delay)
+                                    retry_delay *= 2  
+                                    continue
+                            raise api_err  
                     
-                items_data = json.loads(response.text.strip())
-                for item in items_data:
-                    item['PO_Source_File'] = pdf_file.name
-                    all_po_items.append(item)
+                    if quota_exhausted:
+                        st.stop()
+                        
+                    # 解析當前 Chunk 回傳的 JSON
+                    if response and response.text:
+                        try:
+                            items_data = json.loads(response.text.strip())
+                            for item in items_data:
+                                item['PO_Source_File'] = pdf_file.name
+                                all_po_items.append(item)
+                        except json.JSONDecodeError as je:
+                            st.warning(f"⚠️ 第 {start_page+1}-{end_page} 頁的 JSON 格式解析失敗，已自動跳過此區間。")
                     
+                    # 避免連續請求太快，加入小緩衝
+                    time.sleep(2)
+                        
             except Exception as e:
                 st.error(f"❌ Failed to parse {pdf_file.name}: {e}")
             
             progress_bar.progress((idx + 1) / len(pdf_files))
-            if idx < len(pdf_files) - 1:
-                time.sleep(4)
 
         if not all_po_items:
             st.error("❌ No data was extracted from your PDF items. Processing stopped.")
@@ -264,7 +289,7 @@ if excel_file and pdf_files:
                 ex_date = parse_date_to_custom_format(row.get('Required Date/Time'))
                 pdf_date = parse_date_to_custom_format(match.get('Required_Date'))
                 
-                # --- [修改部分：安全防呆加強版] ---
+                # --- [安全防呆加強版邏輯] ---
                 if pdf_date and str(pdf_date).strip() != "":
                     today_str = datetime.now().strftime("%d%m")
                     delivery_ddmmyy = ""
@@ -273,10 +298,8 @@ if excel_file and pdf_files:
                     if '/' in pdf_date_str:
                         date_parts = pdf_date_str.split('/')
                         if len(date_parts) >= 3:
-                            # 標準 DD/MM/YYYY 狀況
                             delivery_ddmmyy = date_parts[0] + date_parts[1] + date_parts[2][-2:]
                         else:
-                            # 異常狀況：有斜線但長度不足，提取純數字處理
                             digits = "".join([c for c in pdf_date_str if c.isdigit()])
                             if len(digits) >= 8:
                                 delivery_ddmmyy = digits[:4] + digits[-2:]
@@ -285,7 +308,6 @@ if excel_file and pdf_files:
                             else:
                                 delivery_ddmmyy = digits
                     else:
-                        # 無斜線狀況，提取純數字處理
                         digits = "".join([c for c in pdf_date_str if c.isdigit()])
                         if len(digits) >= 8:
                             delivery_ddmmyy = digits[:4] + digits[-2:]
@@ -293,7 +315,6 @@ if excel_file and pdf_files:
                             delivery_ddmmyy = digits[:6]
                         
                     confirmation_note_text = f"{today_str} lla dd conf. {delivery_ddmmyy}"
-                # --- [修改部分結束] ---
 
             else:
                 if 'Notes' in df_excel.columns: pdf_side_row['Notes'] = "Not found in PO PDF"
