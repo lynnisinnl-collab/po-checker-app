@@ -17,7 +17,7 @@ import pypdf  # Requirement: pip install pypdf
 # ==========================================
 st.set_page_config(page_title="PO Checker AI", layout="wide")
 st.title("📦 Purchase Order Checking Assistant")
-st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report with matching confirmation notes.")
+st.write("Upload your System Master Data and PO PDFs to automatically generate a flagged discrepancy report with matching confirmation notes (Supports Split Deliveries & Loose Text/Line Matching).")
 
 # Securely fetch API key
 if "GOOGLE_API_KEY" in st.secrets:
@@ -42,19 +42,15 @@ def clean_description_semantic(val):
     if pd.isna(val) or val is None: return ""
     s = str(val).lower().strip()
     
-    # 1. Unify symbols commonly swapped in item names
     s = s.replace('+', '&').replace('and', '&').replace('en', '&')
     
-    # 2. Map english written word numbers directly to integers to avoid alignment breaks
     word_to_digit = {
         'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
         'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'ten': '10'
     }
     for word, digit in word_to_digit.items():
-        # Use regex boundary to replace full words only, avoiding partial overlaps
         s = re.sub(r'\b' + word + r'\b', digit, s)
         
-    # 3. Strip extra spaces and punctuation to create a pure matching hash string
     s = re.sub(r'[^a-z0-9&]', '', s)
     return s
 
@@ -304,7 +300,6 @@ if excel_file and pdf_files:
             excel_key = clean_key(excel_item)
             ex_line = clean_line_num(row.get('Line'))
             
-            # Translate word numbers to digits for semantic normalization
             excel_desc_cleaned = clean_description_semantic(row.get(unnamed_col, ''))
             
             excel_side_row = {col: row[col] for col in df_excel.columns}
@@ -330,11 +325,9 @@ if excel_file and pdf_files:
                     po_desc_cleaned = clean_description_semantic(po_row.get('Description', ''))
                     po_line_cleaned = clean_line_num(po_row.get('Line', ''))
                     
-                    # Tier 1: Check primary/secondary number keys
                     is_num_match = (excel_key and ((po_key_p and (po_key_p in excel_key or excel_key in po_key_p)) or 
                                                    (po_key_c and (po_key_c in excel_key or excel_key in po_key_c))))
                     
-                    # Tier 2: Match via sequence position index AND advanced word-to-digit translation rules
                     is_line_index_match = (ex_line and po_line_cleaned and ex_line == po_line_cleaned)
                     is_semantic_desc_match = (excel_desc_cleaned and po_desc_cleaned and \
                                               (excel_desc_cleaned in po_desc_cleaned or po_desc_cleaned in excel_desc_cleaned or \
@@ -369,7 +362,15 @@ if excel_file and pdf_files:
                 for d_idx, deliv in enumerate(deliveries):
                     pdf_side_row = {col: None for col in df_excel.columns}
                     pdf_side_row['Data Block Source'] = 'PDF'
-                    pdf_side_row[item_col_name] = excel_item
+                    
+                    # Show actual extracted Part Number from PDF instead of blindly copying Excel
+                    pdf_item = str(matched_po_item.get('Item', '')).strip()
+                    pdf_cust = str(matched_po_item.get('Customer_Item', '')).strip()
+                    if pdf_cust and pdf_cust.lower() not in ['none', 'null', '']:
+                        pdf_side_row[item_col_name] = f"{pdf_item} / {pdf_cust}"
+                    else:
+                        pdf_side_row[item_col_name] = pdf_item
+                    
                     if 'Line' in df_excel.columns: pdf_side_row['Line'] = matched_po_item.get('Line')
                     
                     raw_price = matched_po_item.get('Unit_Price')
@@ -448,11 +449,15 @@ if excel_file and pdf_files:
         df_final = df_final[cols]
         df_final.to_excel(OUTPUT_FILENAME, index=False)
 
-        # Style and Highlight via OpenPyXL using dynamic cell blocks metadata
+        # ==========================================
+        # Style and Highlight Output
+        # ==========================================
         wb = openpyxl.load_workbook(OUTPUT_FILENAME)
         ws = wb.active
         headers = [cell.value for cell in ws[1]]
 
+        idx_item = headers.index(item_col_name) + 1 if item_col_name in headers else None
+        idx_desc = headers.index(unnamed_col) + 1 if unnamed_col in headers else None
         idx_qty = headers.index('Order Quantity') + 1 if 'Order Quantity' in headers else None
         idx_price = headers.index('Unit Price') + 1 if 'Unit Price' in headers else None
         idx_date = headers.index('Required Date/Time') + 1 if 'Required Date/Time' in headers else None
@@ -476,33 +481,77 @@ if excel_file and pdf_files:
                 for c in range(1, len(headers) + 1):
                     ws.cell(row=r, column=c).fill = fill_light_gray
             
+            # Fetch Baseline Glovia Master Values
+            ex_item_val = clean_key(ws.cell(row=glovia_row_num, column=idx_item).value if idx_item else "")
+            ex_desc_val = clean_description_semantic(ws.cell(row=glovia_row_num, column=idx_desc).value if idx_desc else "")
             ex_qty_val, _ = parse_qty_and_unit(ws.cell(row=glovia_row_num, column=idx_qty).value if idx_qty else 0)
             ex_price_val = normalize_price(ws.cell(row=glovia_row_num, column=idx_price).value if idx_price else 0)
-            ex_date_val = str(ws.cell(row=glovia_row_num, column=idx_date).value).strip() if idx_date else ""
+            
+            ex_date_val = ""
+            if idx_date:
+                raw_d = ws.cell(row=glovia_row_num, column=idx_date).value
+                if raw_d is not None and str(raw_d).strip().lower() not in ["none", "nan", ""]:
+                    ex_date_val = str(raw_d).strip()
 
             qty_discrepancy = (ex_qty_val != block["total_pdf_qty"])
 
+            # Check Discrepancies and Highlight BOTH rows red if a mismatch occurs
             for pdf_row_num in range(glovia_row_num + 1, end_r):
+                
+                # 1. ITEM NUMBER HIGHLIGHT
+                if idx_item:
+                    i_cell = ws.cell(row=pdf_row_num, column=idx_item)
+                    pdf_item_val = clean_key(i_cell.value)
+                    # If Excel code is completely missing from the captured PDF code block
+                    if ex_item_val and pdf_item_val and ex_item_val not in pdf_item_val:
+                        ws.cell(row=glovia_row_num, column=idx_item).fill = fill_red
+                        i_cell.fill = fill_red
+
+                # 2. DESCRIPTION (ITEM NAME) HIGHLIGHT
+                if idx_desc:
+                    desc_cell = ws.cell(row=pdf_row_num, column=idx_desc)
+                    pdf_desc_val = clean_description_semantic(desc_cell.value)
+                    
+                    is_desc_match = False
+                    if not ex_desc_val and not pdf_desc_val:
+                        is_desc_match = True
+                    elif ex_desc_val and pdf_desc_val:
+                        if ex_desc_val in pdf_desc_val or pdf_desc_val in ex_desc_val:
+                            is_desc_match = True
+                    
+                    if not is_desc_match and desc_cell.value is not None:
+                        ws.cell(row=glovia_row_num, column=idx_desc).fill = fill_red
+                        desc_cell.fill = fill_red
+
+                # 3. QUANTITY HIGHLIGHT
                 if idx_qty and qty_discrepancy:
                     ws.cell(row=glovia_row_num, column=idx_qty).fill = fill_red
                     ws.cell(row=pdf_row_num, column=idx_qty).fill = fill_red
                     
+                # 4. PRICE HIGHLIGHT
                 if idx_price:
                     p_cell = ws.cell(row=pdf_row_num, column=idx_price)
-                    if ex_price_val != normalize_price(p_cell.value) and p_cell.value is not None:
+                    p_val = normalize_price(p_cell.value)
+                    if p_val is not None and ex_price_val != p_val:
                         ws.cell(row=glovia_row_num, column=idx_price).fill = fill_red
                         p_cell.fill = fill_red
                         
+                # 5. DATE HIGHLIGHT 
                 if idx_date:
                     d_cell = ws.cell(row=pdf_row_num, column=idx_date)
-                    if ex_date_val != str(d_cell.value).strip() and d_cell.value is not None and d_cell.value != "":
+                    pdf_date_val = ""
+                    if d_cell.value is not None and str(d_cell.value).strip().lower() not in ["none", "nan", ""]:
+                        pdf_date_val = str(d_cell.value).strip()
+                        
+                    if pdf_date_val != "" and ex_date_val != pdf_date_val:
+                        ws.cell(row=glovia_row_num, column=idx_date).fill = fill_red
                         d_cell.fill = fill_red
 
         excel_buffer = io.BytesIO()
         wb.save(excel_buffer)
         excel_buffer.seek(0)
 
-        st.success("🎉 Process Complete! Text numbers (four+five) mapped perfectly.")
+        st.success("🎉 Process Complete!")
         st.download_button(
             label="📥 Download Discrepancy Report",
             data=excel_buffer,
