@@ -126,7 +126,7 @@ def normalize_price(v):
     except:
         return None
 
-# Smart date parser supporting dot (.), slash (/), and hyphen (-) formats natively
+# Date parser for output string formatting
 def parse_date_to_custom_format(v):
     if pd.isna(v) or v is None: return ""
     s = str(v).replace(':', '').replace('Delivery Date', '').strip()
@@ -139,6 +139,55 @@ def parse_date_to_custom_format(v):
         except: 
             continue
     return str(v).strip()
+
+# Helper: Parse any date string into a solid Python Date object for robust comparison
+def parse_to_date_obj(v):
+    if pd.isna(v) or v is None: return None
+    s = str(v).strip()
+    if s.lower() in ["", "none", "nan"]: return None
+    
+    # Strip supplier specific noise
+    s = re.sub(r'(?i)wk:|week|verzendschema|leverdatum', '', s).strip()
+    s = s.replace('.', '/').replace('-', '/')
+    parts = s.split(',')
+    if parts:
+        s = parts[0].strip().split()[0]
+    else:
+        return None
+        
+    for fmt in ('%d/%m/%Y', '%Y/%m/%d', '%m/%d/%Y', '%d-%m-%Y', '%Y-%m-%d'):
+        try: 
+            return pd.to_datetime(s, format=fmt).date()
+        except: 
+            continue
+    return None
+
+# SMART DATE COMPARISON: Determines if cells should be highlighted red
+def is_date_discrepancy(ex_val, pdf_val):
+    ex_str = str(ex_val).strip() if pd.notna(ex_val) and ex_val is not None else ""
+    pdf_str = str(pdf_val).strip() if pd.notna(pdf_val) and pdf_val is not None else ""
+    
+    # Rule 1: If Excel has NO date, do not flag (prevents "always red" issue)
+    if ex_str.lower() in ["", "none", "nan"]:
+        return False
+        
+    # Rule 2: If Excel HAS a date, but PDF has NO date, it's a missing data discrepancy
+    if pdf_str.lower() in ["", "none", "nan"]:
+        return True
+        
+    # Rule 3: Exact string match is always valid
+    if ex_str == pdf_str:
+        return False
+        
+    # Rule 4: Parse both to real Date Objects to ignore formatting (e.g., 07/08/2026 vs 7-8-2026)
+    ex_obj = parse_to_date_obj(ex_str)
+    pdf_obj = parse_to_date_obj(pdf_str)
+    
+    if ex_obj and pdf_obj:
+        return ex_obj != pdf_obj
+        
+    # If one or both couldn't be parsed to objects, and strings aren't identical, flag it
+    return True
 
 # ==========================================
 # UI FILE UPLOADERS
@@ -363,7 +412,6 @@ if excel_file and pdf_files:
                     pdf_side_row = {col: None for col in df_excel.columns}
                     pdf_side_row['Data Block Source'] = 'PDF'
                     
-                    # Show actual extracted Part Number from PDF instead of blindly copying Excel
                     pdf_item = str(matched_po_item.get('Item', '')).strip()
                     pdf_cust = str(matched_po_item.get('Customer_Item', '')).strip()
                     if pdf_cust and pdf_cust.lower() not in ['none', 'null', '']:
@@ -487,22 +535,16 @@ if excel_file and pdf_files:
             ex_qty_val, _ = parse_qty_and_unit(ws.cell(row=glovia_row_num, column=idx_qty).value if idx_qty else 0)
             ex_price_val = normalize_price(ws.cell(row=glovia_row_num, column=idx_price).value if idx_price else 0)
             
-            ex_date_val = ""
-            if idx_date:
-                raw_d = ws.cell(row=glovia_row_num, column=idx_date).value
-                if raw_d is not None and str(raw_d).strip().lower() not in ["none", "nan", ""]:
-                    ex_date_val = str(raw_d).strip()
-
+            ex_date_raw = ws.cell(row=glovia_row_num, column=idx_date).value if idx_date else None
             qty_discrepancy = (ex_qty_val != block["total_pdf_qty"])
 
-            # Check Discrepancies and Highlight BOTH rows red if a mismatch occurs
+            # Highlight Check Loop
             for pdf_row_num in range(glovia_row_num + 1, end_r):
                 
                 # 1. ITEM NUMBER HIGHLIGHT
                 if idx_item:
                     i_cell = ws.cell(row=pdf_row_num, column=idx_item)
                     pdf_item_val = clean_key(i_cell.value)
-                    # If Excel code is completely missing from the captured PDF code block
                     if ex_item_val and pdf_item_val and ex_item_val not in pdf_item_val:
                         ws.cell(row=glovia_row_num, column=idx_item).fill = fill_red
                         i_cell.fill = fill_red
@@ -511,14 +553,12 @@ if excel_file and pdf_files:
                 if idx_desc:
                     desc_cell = ws.cell(row=pdf_row_num, column=idx_desc)
                     pdf_desc_val = clean_description_semantic(desc_cell.value)
-                    
                     is_desc_match = False
                     if not ex_desc_val and not pdf_desc_val:
                         is_desc_match = True
                     elif ex_desc_val and pdf_desc_val:
                         if ex_desc_val in pdf_desc_val or pdf_desc_val in ex_desc_val:
                             is_desc_match = True
-                    
                     if not is_desc_match and desc_cell.value is not None:
                         ws.cell(row=glovia_row_num, column=idx_desc).fill = fill_red
                         desc_cell.fill = fill_red
@@ -536,14 +576,10 @@ if excel_file and pdf_files:
                         ws.cell(row=glovia_row_num, column=idx_price).fill = fill_red
                         p_cell.fill = fill_red
                         
-                # 5. DATE HIGHLIGHT 
+                # 5. SMART DATE HIGHLIGHT
                 if idx_date:
                     d_cell = ws.cell(row=pdf_row_num, column=idx_date)
-                    pdf_date_val = ""
-                    if d_cell.value is not None and str(d_cell.value).strip().lower() not in ["none", "nan", ""]:
-                        pdf_date_val = str(d_cell.value).strip()
-                        
-                    if pdf_date_val != "" and ex_date_val != pdf_date_val:
+                    if is_date_discrepancy(ex_date_raw, d_cell.value):
                         ws.cell(row=glovia_row_num, column=idx_date).fill = fill_red
                         d_cell.fill = fill_red
 
